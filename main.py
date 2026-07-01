@@ -225,8 +225,8 @@ def change_password(
     res = supabase.table("users").select("password_hash").eq("uid", uid).single().execute()
     if not res.data or not verify_password(body.old_password, res.data["password_hash"]):
         raise HTTPException(status_code=400, detail="目前密碼不正確")
-    if len(body.new_password) < 6:
-        raise HTTPException(status_code=400, detail="新密碼至少 6 個字元")
+    if len(body.new_password) < 4:
+        raise HTTPException(status_code=400, detail="新密碼至少 4 個字元")
     supabase.table("users").update({
         "password_hash": get_password_hash(body.new_password)
     }).eq("uid", uid).execute()
@@ -239,8 +239,8 @@ def reset_password(
     body: AdminResetPassword,
     current_user: dict = Depends(require_roles("admin", "superadmin")),
 ):
-    if len(body.new_password) < 6:
-        raise HTTPException(status_code=400, detail="密碼至少 6 個字元")
+    if len(body.new_password) < 4:
+        raise HTTPException(status_code=400, detail="密碼至少 4 個字元")
     supabase.table("users").update({
         "password_hash": get_password_hash(body.new_password)
     }).eq("uid", uid).execute()
