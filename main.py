@@ -142,9 +142,14 @@ def login(request: LoginRequest):
 
 @app.get("/users")
 def get_users(current_user: dict = Depends(get_current_user)):
-    res = supabase.table("users").select(
-        "uid, name, role, level, attr, halftime, note, sort_order, created_at"
-    ).order("sort_order").order("created_at").execute()
+    try:
+        res = supabase.table("users").select(
+            "uid, name, role, level, attr, halftime, note, sort_order, created_at"
+        ).order("sort_order").order("created_at").execute()
+    except Exception:
+        res = supabase.table("users").select(
+            "uid, name, role, level, attr, halftime, note, created_at"
+        ).order("created_at").execute()
     return {"users": res.data}
 
 
@@ -245,6 +250,7 @@ def reset_password(
         "password_hash": get_password_hash(body.new_password)
     }).eq("uid", uid).execute()
     return {"message": "密碼已重設"}
+
 
 
 @app.delete("/users/{uid}")
