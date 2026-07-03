@@ -488,17 +488,20 @@ def generate_schedule(
     no_reverse   = bool(scheduling.get("no_reverse_shift", True))
     restrict_first_weekend = bool(scheduling.get("restrict_first_weekend", True))
     one_in_seven = bool(scheduling.get("one_in_seven", False))  # 一例一休
-    lock_designated_off = bool(scheduling.get("lock_designated_off", False))
-    weekly_max_off_auto  = int(scheduling.get("weekly_max_off_auto", 2))   # 自動休每週上限
-    weekly_max_off_total = int(scheduling.get("weekly_max_off_total", 3))  # 含指定休每週上限
+    lock_first_day       = bool(scheduling.get("lock_first_day", True))
+    lock_designated_off  = bool(scheduling.get("lock_designated_off", True))
+    weekly_max_off_auto  = int(scheduling.get("weekly_max_off_auto", 2))   # 自動休連續天數上限
+    weekly_max_off_total = int(scheduling.get("weekly_max_off_total", 3))  # 每週應休總上限
     holiday_days = int(cycle.get("holiday_days", 0))
     full_off  = min(8 + holiday_days, 13)
     part_off  = min(16 + holiday_days, 21)
 
     # 班別視同 D 的特殊班（不計臨床人力，但算上班日）
     ADMIN_SHIFTS = {"會", "公", "書記"}
-    # 特休 / 員旅 → 最高順位不被覆蓋
-    PRIORITY_OFF = {"V", "員"}
+    # 放假/調整類：最高順位鎖定，不佔應休名額
+    LEAVE_ADJUST = {"V", "員", "喪", "延休", "補休", "調移"}
+    # 固定班型索引（用於軟懲罰）
+    FIXED_SHIFT_MAP = {"固定D": 0, "固定E": 1, "固定N": 2}
 
     # ── 讀取護理師
     nurses_res = supabase.table("users").select(
@@ -571,6 +574,7 @@ def generate_schedule(
 
     # ── CP-SAT 模型
     model = cp_model.CpModel()
+    leave_adjust_per_m: dict[int, set[int]] = {}  # 各護理師的 LEAVE_ADJUST 天索引
 
     # x[m][t] ∈ {0,1,2,3} → D/E/N/OFF
     x: list[list] = [
@@ -595,8 +599,9 @@ def generate_schedule(
             model.add(x[m][t] == sum(s * b[m][t][s] for s in range(4)))
             model.add_exactly_one(b[m][t])
 
-        # ── 鎖定已確認班 / 特休 / 指定休
-        locked_off_days_m: set[int] = set()  # 記錄指定 OFF 的天索引（不含特休/員旅）
+        # ── 鎖定已確認班 / 放假調整類 / 指定休
+        locked_off_days_m: set[int] = set()    # 指定 OFF（計入應休名額）
+        leave_adjust_days_m: set[int] = set()  # 放假/調整類（不佔應休名額）
         for t, d_str in enumerate(cycle_dates):
             key = (uid, d_str)
             if key not in existing:
@@ -605,51 +610,66 @@ def generate_schedule(
             shift = row.get("shift") or "OFF"
             confirmed = row.get("confirmed", False)
 
-            # 半職視同 OFF
+            # 半職視同 OFF（計入應休名額）
             if shift == "半":
                 shift = "OFF"
 
-            # 行政班視同 D（不計臨床人力，但視同上班）
+            # 行政班視同 D
             if shift in ADMIN_SHIFTS:
                 shift = "D"
 
-            if shift in PRIORITY_OFF:
-                # 特休/員旅：最高順位，一定保留，不占指定休/自動休名額
+            # 放假/調整類：鎖定為 OFF，不佔應休名額
+            if shift in LEAVE_ADJUST:
                 model.add(x[m][t] == 3)
+                leave_adjust_days_m.add(t)
                 continue
 
+            # 已確認班
             if confirmed and not overwrite_confirmed:
                 si = SI.get(shift, 3)
                 model.add(x[m][t] == si)
                 if si == 3:
-                    locked_off_days_m.add(t)  # 已確認的 OFF = 指定休
+                    locked_off_days_m.add(t)
                 continue
 
+            # 第一天鎖定
+            if lock_first_day and t == 0:
+                si = SI.get(shift, 3)
+                model.add(x[m][t] == si)
+                if si == 3:
+                    locked_off_days_m.add(t)
+                continue
+
+            # 指定休不可覆蓋
             if lock_designated_off and shift == "OFF":
                 model.add(x[m][t] == 3)
                 locked_off_days_m.add(t)
 
-        # ── 允許班種限制（依輪班屬性）
-        allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
-        allowed_si = set(SI[s] for s in allowed) | {3}  # OFF 永遠允許
-        for t in range(n):
-            for s in range(4):
-                if s not in allowed_si:
-                    model.add(b[m][t][s] == 0)
+        # ── 允許班種限制（輪班類硬限制；固定班改用軟懲罰）
+        fixed_si = FIXED_SHIFT_MAP.get(attr)
+        if fixed_si is None:
+            allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
+            allowed_si = set(SI[s] for s in allowed) | {3}
+            for t in range(n):
+                for s in range(4):
+                    if s not in allowed_si:
+                        model.add(b[m][t][s] == 0)
 
-        # ── 休假天數
+        # ── 休假天數（LEAVE_ADJUST 不計入應休名額）
+        la_count = len(leave_adjust_days_m)
         off_days = part_off if is_ht else full_off
-        off_days = min(off_days, n - 1)
-        work_days = n - off_days
-        d_cnt, e_cnt, nv_cnt = shift_counts(attr, work_days, uid)
+        off_days = min(off_days, n - la_count - 1)
+        effective_work_days = max(0, n - off_days - la_count)
+        d_cnt, e_cnt, nv_cnt = shift_counts(attr, effective_work_days, uid)
 
         # 軟約束：目標班次數（允許偏差 ±2）
-        total_d = sum(b[m][t][0] for t in range(n))
-        total_e = sum(b[m][t][1] for t in range(n))
+        total_d  = sum(b[m][t][0] for t in range(n))
+        total_e  = sum(b[m][t][1] for t in range(n))
         total_nv = sum(b[m][t][2] for t in range(n))
-        total_off = sum(b[m][t][3] for t in range(n))
-        model.add(total_off >= off_days - 2)
-        model.add(total_off <= off_days + 2)
+        # 應休 OFF（排除 LEAVE_ADJUST）
+        free_off = [b[m][t][3] for t in range(n) if t not in leave_adjust_days_m]
+        model.add(sum(free_off) >= off_days - 2)
+        model.add(sum(free_off) <= off_days + 2)
         model.add(total_d  >= max(0, d_cnt  - 2))
         model.add(total_d  <= d_cnt  + 2)
         model.add(total_e  >= max(0, e_cnt  - 2))
@@ -719,14 +739,23 @@ def generate_schedule(
                 # 不能同時都是 OFF
                 model.add(b[m][sat_idx][3] + b[m][sun_idx][3] <= 1)
 
-        # ── 規則 6/7：每週 OFF 天數上限
+        # ── 規則 7：每週應休（不含 LEAVE_ADJUST）總天數上限
         for ws, we in weeks:
-            # 規則 7：含指定休每週最多 weekly_max_off_total 天（預設 3）
-            model.add(sum(b[m][t][3] for t in range(ws, we+1)) <= weekly_max_off_total)
-            # 規則 6：自動休（排除已鎖定的指定休）每週最多 weekly_max_off_auto 天（預設 2）
-            auto_off_in_week = [b[m][t][3] for t in range(ws, we+1) if t not in locked_off_days_m]
-            if auto_off_in_week:
-                model.add(sum(auto_off_in_week) <= weekly_max_off_auto)
+            reg_off_wk = [b[m][t][3] for t in range(ws, we+1) if t not in leave_adjust_days_m]
+            if reg_off_wk:
+                model.add(sum(reg_off_wk) <= weekly_max_off_total)
+
+        # ── 規則 6（新）：自動休連續天數不超過 weekly_max_off_auto 天
+        for t in range(n - weekly_max_off_auto):
+            auto_off_win = [
+                b[m][t+k][3]
+                for k in range(weekly_max_off_auto + 1)
+                if (t+k) not in locked_off_days_m and (t+k) not in leave_adjust_days_m
+            ]
+            if len(auto_off_win) > weekly_max_off_auto:
+                model.add(sum(auto_off_win) <= weekly_max_off_auto)
+
+        leave_adjust_per_m[m] = leave_adjust_days_m
 
     # ── 硬規則 1：每班每日至少 1 leader + 1 (leader or second)，不同人
     leaders = [i for i, n in enumerate(nurses) if n.get("level") == "leader"]
@@ -736,8 +765,8 @@ def generate_schedule(
         for si, req in [(0, daily_d), (1, daily_e), (2, daily_n)]:
             if req == 0:
                 continue
-            # 至少 req 人上班
-            model.add(sum(b[m][t][si] for m in range(M)) >= req)
+            # 剛好 req 人上班
+            model.add(sum(b[m][t][si] for m in range(M)) == req)
             # 至少 1 leader
             if leaders:
                 model.add(sum(b[m][t][si] for m in leaders) >= 1)
@@ -745,23 +774,33 @@ def generate_schedule(
             if len(seconds) >= 2:
                 model.add(sum(b[m][t][si] for m in seconds) >= 2)
 
-    # ── 軟規則：順班目標（同種班連續排列）
-    # 懲罰班別切換（相鄰兩天不同班種）
+    # ── 軟規則：順班目標 + 固定班偏離懲罰
+    FIX_PENALTY = 20  # 固定班偏離懲罰（遠高於換班懲罰 1）
     penalties = []
     for m in range(M):
         attr = nurses[m].get("attr") or "輪班DEN"
-        allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
-        if len(allowed) <= 1:
-            continue  # 固定班不需要順班懲罰
-        for t in range(n - 1):
-            for s1 in range(3):
-                for s2 in range(3):
-                    if s1 != s2 and WORK_SHIFTS[s1] in allowed and WORK_SHIFTS[s2] in allowed:
-                        switch = model.new_bool_var(f"sw_{m}_{t}_{s1}_{s2}")
-                        # switch=1 iff (day t = s1 AND day t+1 = s2)
-                        # 透過 >= 讓 minimize 自動把 switch 壓到 0（即避免切換）
-                        model.add(switch >= b[m][t][s1] + b[m][t+1][s2] - 1)
-                        penalties.append(switch)
+        fixed_si = FIXED_SHIFT_MAP.get(attr)
+        la_set = leave_adjust_per_m.get(m, set())
+
+        if fixed_si is not None:
+            # 固定班：懲罰非固定班種（軟規則，人力不足時才允許偏離）
+            for t in range(n):
+                if t not in la_set:
+                    for s in range(3):
+                        if s != fixed_si:
+                            penalties.append(b[m][t][s] * FIX_PENALTY)
+        else:
+            # 輪班：懲罰班種切換（順班軟規則）
+            allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
+            if len(allowed) <= 1:
+                continue
+            for t in range(n - 1):
+                for s1 in range(3):
+                    for s2 in range(3):
+                        if s1 != s2 and WORK_SHIFTS[s1] in allowed and WORK_SHIFTS[s2] in allowed:
+                            switch = model.new_bool_var(f"sw_{m}_{t}_{s1}_{s2}")
+                            model.add(switch >= b[m][t][s1] + b[m][t+1][s2] - 1)
+                            penalties.append(switch)
 
     model.minimize(sum(penalties))
 
@@ -794,7 +833,7 @@ def generate_schedule(
             key = (nurse["uid"], d_str)
             if key in existing:
                 orig = existing[key].get("shift") or "OFF"
-                if orig in PRIORITY_OFF:
+                if orig in LEAVE_ADJUST:
                     sched[t] = orig
                 elif orig in ADMIN_SHIFTS:
                     sched[t] = orig  # 行政班保留原班碼
