@@ -496,10 +496,18 @@ def generate_schedule(
     full_off  = min(8 + holiday_days, 13)
     part_off  = min(16 + holiday_days, 21)
 
-    # 班別視同 D 的特殊班（不計臨床人力，但算上班日）
-    ADMIN_SHIFTS = {"會", "公", "書記"}
-    # 放假/調整類：最高順位鎖定，不佔應休名額
-    LEAVE_ADJUST = {"V", "員", "喪", "延休", "補休", "調移"}
+    # 從規則讀取班別定義（前端班別設定儲存的三分類）
+    shift_defs = rules.get("shifts", {})
+    _rest_defs  = shift_defs.get("rest", [])   # 應休班別（OFF、半）
+    _leave_defs = shift_defs.get("off",  [])   # 放假/調整類（V、喪、員⋯）
+    _work_defs  = shift_defs.get("work", [])   # 上班類（D、E、N、會、公、書記⋯）
+
+    # 應休代碼集：計入應休天數名額（預設 OFF + 半）
+    REST_CODES = {s["code"] for s in _rest_defs if s.get("code")} or {"OFF", "半"}
+    # 放假/調整代碼集：最高順位鎖定，不佔應休名額（預設 V、員⋯）
+    LEAVE_ADJUST = {s["code"] for s in _leave_defs if s.get("code")} or {"V", "員", "喪", "延休", "補休", "調移"}
+    # 行政/上班班別視同 D（不計臨床人力）：admin_only 的上班類
+    ADMIN_SHIFTS = {s["code"] for s in _work_defs if s.get("admin_only")} or {"會", "公", "書記"}
     # 固定班型索引（用於軟懲罰）
     FIXED_SHIFT_MAP = {"固定D": 0, "固定E": 1, "固定N": 2}
 
@@ -610,8 +618,8 @@ def generate_schedule(
             shift = row.get("shift") or "OFF"
             confirmed = row.get("confirmed", False)
 
-            # 半職視同 OFF（計入應休名額）
-            if shift == "半":
+            # 應休類（REST_CODES）一律視同 OFF 處理（計入應休名額）
+            if shift in REST_CODES and shift != "OFF":
                 shift = "OFF"
 
             # 行政班視同 D
@@ -834,11 +842,11 @@ def generate_schedule(
             if key in existing:
                 orig = existing[key].get("shift") or "OFF"
                 if orig in LEAVE_ADJUST:
-                    sched[t] = orig
+                    sched[t] = orig  # 放假/調整類：保留原班碼
                 elif orig in ADMIN_SHIFTS:
-                    sched[t] = orig  # 行政班保留原班碼
-                elif orig == "半":
-                    sched[t] = "半"
+                    sched[t] = orig  # 行政班：保留原班碼
+                elif orig in REST_CODES and orig != "OFF":
+                    sched[t] = orig  # 應休類（如半）：保留原班碼
         schedules[nurse["uid"]] = sched
 
     # ── 寫入資料庫
