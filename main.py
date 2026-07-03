@@ -1,15 +1,18 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
 import bcrypt as _bcrypt
 from jose import JWTError, jwt
 from datetime import datetime, timedelta, date as date_type
-import math, os
+import math, os, io
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from ortools.sat.python import cp_model
+import openpyxl
+from openpyxl.styles import Font, Border, Side, Alignment, PatternFill
 
 load_dotenv()
 
@@ -580,9 +583,25 @@ def generate_schedule(
     WORK_SHIFTS = ["D","E","N"]
     SI = {s: i for i, s in enumerate(["D","E","N","OFF"])}  # shift index
 
+    # ── 讀取上週參考資料（週期前 7 天，用於跨週連班與班型轉換判斷）
+    prev_dates_list = [(start_d - timedelta(days=7-i)).isoformat() for i in range(7)]
+    prev_res = supabase.table("shifts").select("nurse_uid, date, shift") \
+        .gte("date", prev_dates_list[0]).lte("date", prev_dates_list[-1]).execute()
+    prev_shifts_by_nurse: dict[str, list[str]] = {}
+    for r in (prev_res.data or []):
+        uid_r = r["nurse_uid"]
+        if uid_r not in prev_shifts_by_nurse:
+            prev_shifts_by_nurse[uid_r] = ["OFF"] * 7
+        try:
+            idx = prev_dates_list.index(r["date"])
+            prev_shifts_by_nurse[uid_r][idx] = r.get("shift") or "OFF"
+        except ValueError:
+            pass
+
     # ── CP-SAT 模型
     model = cp_model.CpModel()
     leave_adjust_per_m: dict[int, set[int]] = {}  # 各護理師的 LEAVE_ADJUST 天索引
+    off_slack_vars: list[tuple[int, any]] = []     # (m, slack_var) for shortage warning
 
     # x[m][t] ∈ {0,1,2,3} → D/E/N/OFF
     x: list[list] = [
@@ -670,14 +689,19 @@ def generate_schedule(
         effective_work_days = max(0, n - off_days - la_count)
         d_cnt, e_cnt, nv_cnt = shift_counts(attr, effective_work_days, uid)
 
-        # 軟約束：目標班次數（允許偏差 ±2）
+        # 班次數約束（允許偏差 ±2）
         total_d  = sum(b[m][t][0] for t in range(n))
         total_e  = sum(b[m][t][1] for t in range(n))
         total_nv = sum(b[m][t][2] for t in range(n))
         # 應休 OFF（排除 LEAVE_ADJUST）
         free_off = [b[m][t][3] for t in range(n) if t not in leave_adjust_days_m]
-        model.add(sum(free_off) >= off_days - 2)
+        # 人力不足鬆弛：off_days 下限允許最多減少 MAX_OFF_REDUCE 天（懲罰極高）
+        MAX_OFF_REDUCE = 2
+        off_slack = model.new_int_var(0, MAX_OFF_REDUCE, f"off_slack_{m}")
+        off_slack_vars.append((m, off_slack))
+        model.add(sum(free_off) >= off_days - 2 - off_slack)
         model.add(sum(free_off) <= off_days + 2)
+        penalties.append(off_slack * 200)   # 遠高於切換懲罰，只在必要時才縮減
         model.add(total_d  >= max(0, d_cnt  - 2))
         model.add(total_d  <= d_cnt  + 2)
         model.add(total_e  >= max(0, e_cnt  - 2))
@@ -721,7 +745,23 @@ def generate_schedule(
             model.add(sum(b[m][t][2] for t in range(ws, we+1)) == 0).only_enforce_if(has_N.negated())
             model.add(has_D + has_E + has_N <= 2)
 
-        # ── 連班上限
+        # ── 跨週連班：計算上週末尾連續上班天數，限制週期開頭
+        prev_sched_m = prev_shifts_by_nurse.get(uid, ["OFF"] * 7)
+        trailing_work = 0
+        for ps in reversed(prev_sched_m):
+            if ps not in REST_CODES and ps not in LEAVE_ADJUST and ps != "OFF":
+                trailing_work += 1
+            else:
+                break
+        if trailing_work > 0:
+            remaining = max(0, max_consec - trailing_work)
+            # 週期開頭 (remaining+1) 天內，上班天數不得超過 remaining
+            end_t = min(n, remaining + 1)
+            model.add(
+                sum(b[m][t][s] for t in range(end_t) for s in range(3)) <= remaining
+            )
+
+        # ── 連班上限（週期內）
         for t in range(n - max_consec):
             model.add(
                 sum(b[m][t+k][s] for k in range(max_consec+1) for s in range(3)) <= max_consec
@@ -809,6 +849,36 @@ def generate_schedule(
             if len(allowed) <= 1:
                 continue
             max_gap = weekly_max_off_total  # Rule7 限制最大連續 OFF
+
+            # 跨週班型轉換懲罰：上週最後一個非 OFF 班型
+            uid_m = nurses[m]["uid"]
+            prev_m = prev_shifts_by_nurse.get(uid_m, ["OFF"] * 7)
+            last_prev_si = None
+            for ps in reversed(prev_m):
+                pi = SI.get(ps)
+                if pi is not None and pi < 3 and WORK_SHIFTS[pi] in allowed:
+                    last_prev_si = pi
+                    break
+            if last_prev_si is not None:
+                for s2 in range(3):
+                    if s2 == last_prev_si or WORK_SHIFTS[s2] not in allowed:
+                        continue
+                    # g=0（跨週直接切換）：day0 是 s2
+                    sw_p0 = model.new_bool_var(f"prev_gsw0_{m}_{s2}")
+                    model.add(sw_p0 >= b[m][0][s2])
+                    penalties.append(sw_p0 * 3)
+                    # g=1（跨週隔 1 OFF）：day0=OFF, day1=s2
+                    if n >= 2:
+                        sw_p1 = model.new_bool_var(f"prev_gsw1_{m}_{s2}")
+                        model.add(sw_p1 >= b[m][0][3] + b[m][1][s2] - 1)
+                        penalties.append(sw_p1 * 2)
+                    # g=2（跨週隔 2 OFF）：day0=OFF, day1=OFF, day2=s2
+                    if n >= 3:
+                        sw_p2 = model.new_bool_var(f"prev_gsw2_{m}_{s2}")
+                        model.add(sw_p2 >= b[m][0][3] + b[m][1][3] + b[m][2][s2] - 2)
+                        penalties.append(sw_p2 * 2)
+
+            # 週期內班型轉換懲罰
             for t in range(1, n):
                 for s2 in range(3):
                     if WORK_SHIFTS[s2] not in allowed:
@@ -905,13 +975,192 @@ def generate_schedule(
             "updated_at": datetime.utcnow().isoformat(),
         }).eq("nurse_uid", row["nurse_uid"]).eq("date", row["date"]).execute()
 
+    # ── 人力不足警告（off_slack > 0）
+    warnings: list[str] = []
+    nurse_name_map = {n["uid"]: n.get("name", n["uid"]) for n in nurses_res.data or []}
+    reduced_nurses = []
+    for mi, slack_var in off_slack_vars:
+        v = solver.value(slack_var)
+        if v > 0:
+            nm = nurses[mi].get("name") or nurses[mi]["uid"]
+            reduced_nurses.append(f"{nm}（減 {v} 天）")
+    if reduced_nurses:
+        warnings.append("⚠ 人力不足，以下護理師應休天數已自動縮減：" + "、".join(reduced_nurses))
+
+    # ── 異常偵測
+    anomalies: list[str] = []
+    nurse_uid_list = [n["uid"] for n in nurses]
+    SHIFT_NAMES_DETECT = ["D", "E", "N", "OFF"]
+    for mi, nurse in enumerate(nurses):
+        sched_m = [SHIFT_NAMES_DETECT[solver.value(x[mi][t])] for t in range(n)]
+        nm = nurse.get("name") or nurse["uid"]
+        # 跨週連班異常（結合上週末尾）
+        prev_m = prev_shifts_by_nurse.get(nurse["uid"], ["OFF"] * 7)
+        combined = prev_m + sched_m
+        consec = 0
+        for ps in combined:
+            if ps not in REST_CODES and ps not in LEAVE_ADJUST and ps != "OFF":
+                consec += 1
+                if consec > max_consec:
+                    anomalies.append(f"⚠ {nm}：跨週連續上班超過 {max_consec} 天（含上週）")
+                    break
+            else:
+                consec = 0
+    # leader 不足（每日每班檢查）
+    leader_indices = [i for i, n in enumerate(nurses) if n.get("level") == "leader"]
+    for t in range(n):
+        for si, req in [(0, daily_d), (1, daily_e), (2, daily_n)]:
+            if req == 0:
+                continue
+            if not any(solver.value(b[li][t][si]) for li in leader_indices):
+                d_str = cycle_dates[t]
+                shift_name = ["D","E","N"][si]
+                anomalies.append(f"⚠ {d_str} {shift_name}班：無 leader 排班")
+                break  # 每天只報一次
+
+    # ── 儲存本次系統生成的格子鍵（供 Excel 匯出區分人工／系統）
+    generated_keys = [f"{row['nurse_uid']}_{row['date']}" for row in to_insert]
+    # 更新 rules 表
+    rules_res2 = supabase.table("rules").select("id", "data").limit(1).execute()
+    if rules_res2.data:
+        cur_data = rules_res2.data[0].get("data") or {}
+        cur_data["last_generated_keys"] = generated_keys
+        cur_data["last_generated_at"] = datetime.utcnow().isoformat()
+        supabase.table("rules").update({"data": cur_data}).eq("id", rules_res2.data[0]["id"]).execute()
+
     total = len(to_insert) + len(to_update)
     return {
         "message": f"✓ 已生成 {len(nurses)} 位護理師的班表（共 {total} 格）",
         "solver_status": solver.status_name(status),
         "nurses": len(nurses), "cells": total,
         "inserted": len(to_insert), "updated": len(to_update),
+        "warnings": warnings,
+        "anomalies": anomalies,
     }
+
+
+def _make_border(thick=False):
+    s = Side(style="medium" if thick else "thin", color="000000")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def _build_excel(title: str, rows: list[dict], bold_keys: set[str], rest_codes: set[str]) -> io.BytesIO:
+    """
+    共用 Excel 建構函式。
+    rows: [{name, uid, date, shift}]
+    bold_keys: nurse_uid_date 組合 → 外框加粗（人工填寫）
+    rest_codes: 需轉顯示為「休假」的班別代碼集合（應休類）
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = title
+
+    headers = ["姓名", "帳號", "日期", "班別"]
+    for ci, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font = Font(bold=True, size=11)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = _make_border(thick=False)
+        cell.fill = PatternFill("solid", fgColor="D9EAF7")
+
+    for ri, row in enumerate(rows, 2):
+        key = f"{row['uid']}_{row['date']}"
+        is_manual = key in bold_keys
+        display_shift = "休假" if row["shift"] in rest_codes else row["shift"]
+        vals = [row["name"], row["uid"], row["date"], display_shift]
+        for ci, v in enumerate(vals, 1):
+            cell = ws.cell(row=ri, column=ci, value=v)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = _make_border(thick=is_manual)
+            if is_manual:
+                cell.font = Font(bold=False)
+
+    # 欄寬
+    for ci, w in enumerate([14, 14, 14, 10], 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(ci)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@app.get("/export/preview")
+def export_preview(
+    current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
+):
+    """匯出預假狀態：目前所有護理師已填寫的班別（不分系統/人工）"""
+    rules_res = supabase.table("rules").select("*").limit(1).execute()
+    rules = rules_res.data[0].get("data") or {} if rules_res.data else {}
+    cycle = rules.get("cycle", {})
+    start_str, end_str = cycle.get("start_date"), cycle.get("end_date")
+    if not start_str or not end_str:
+        raise HTTPException(400, "請先設定排班週期")
+    shift_defs = rules.get("shifts", {})
+    rest_codes = {s["code"] for s in shift_defs.get("rest", []) if s.get("code")} or {"OFF", "半"}
+
+    users_res = supabase.table("users").select("uid, name").in_("role", ["nurse", "dual"]).order("sort_order").execute()
+    uid_name = {u["uid"]: u["name"] for u in (users_res.data or [])}
+
+    shifts_res = supabase.table("shifts").select("nurse_uid, date, shift") \
+        .gte("date", start_str).lte("date", end_str).order("date").execute()
+
+    rows = []
+    for r in (shifts_res.data or []):
+        if not r.get("shift") or r["shift"] == "OFF":
+            continue
+        rows.append({"name": uid_name.get(r["nurse_uid"], r["nurse_uid"]),
+                     "uid": r["nurse_uid"], "date": r["date"], "shift": r["shift"]})
+
+    buf = _build_excel("預假狀態", rows, bold_keys=set(), rest_codes=rest_codes - {"OFF"})
+    filename = f"預假狀態_{start_str}_{end_str}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
+
+
+@app.get("/export/schedule")
+def export_schedule(
+    current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
+):
+    """匯出完整班表：生成前人工填寫的格子外框加粗；半職轉顯示為休假"""
+    rules_res = supabase.table("rules").select("*").limit(1).execute()
+    rules = rules_res.data[0].get("data") or {} if rules_res.data else {}
+    cycle = rules.get("cycle", {})
+    start_str, end_str = cycle.get("start_date"), cycle.get("end_date")
+    if not start_str or not end_str:
+        raise HTTPException(400, "請先設定排班週期")
+    shift_defs = rules.get("shifts", {})
+    rest_codes = {s["code"] for s in shift_defs.get("rest", []) if s.get("code")} or {"OFF", "半"}
+    # 人工填寫的格子 = 不在 last_generated_keys 裡的格子
+    generated_keys = set(rules.get("last_generated_keys", []))
+
+    users_res = supabase.table("users").select("uid, name").in_("role", ["nurse", "dual"]).order("sort_order").execute()
+    uid_name = {u["uid"]: u["name"] for u in (users_res.data or [])}
+
+    shifts_res = supabase.table("shifts").select("nurse_uid, date, shift") \
+        .gte("date", start_str).lte("date", end_str).order("date").execute()
+
+    rows = []
+    manual_keys = set()
+    for r in (shifts_res.data or []):
+        shift = r.get("shift") or "OFF"
+        if shift == "OFF":
+            continue
+        key = f"{r['nurse_uid']}_{r['date']}"
+        if key not in generated_keys:
+            manual_keys.add(key)
+        rows.append({"name": uid_name.get(r["nurse_uid"], r["nurse_uid"]),
+                     "uid": r["nurse_uid"], "date": r["date"], "shift": shift})
+
+    buf = _build_excel("完整班表", rows, bold_keys=manual_keys, rest_codes=rest_codes - {"OFF"})
+    filename = f"完整班表_{start_str}_{end_str}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
 
 
 @app.get("/logs")
