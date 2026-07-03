@@ -803,17 +803,32 @@ def generate_schedule(
                         if s != fixed_si:
                             penalties.append(b[m][t][s] * FIX_PENALTY)
         else:
-            # 輪班：懲罰班種切換（順班軟規則）
+            # 輪班：懲罰班種切換（含跨 OFF 天，找前一個非 OFF 班型）
+            # 不論中間隔幾天 OFF，只要班型轉換就 +2
             allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
             if len(allowed) <= 1:
                 continue
-            for t in range(n - 1):
-                for s1 in range(3):
-                    for s2 in range(3):
-                        if s1 != s2 and WORK_SHIFTS[s1] in allowed and WORK_SHIFTS[s2] in allowed:
-                            switch = model.new_bool_var(f"sw_{m}_{t}_{s1}_{s2}")
-                            model.add(switch >= b[m][t][s1] + b[m][t+1][s2] - 1)
-                            penalties.append(switch)
+            max_gap = weekly_max_off_total  # Rule7 限制最大連續 OFF，不需檢查更大間距
+            for t in range(1, n):
+                for s2 in range(3):
+                    if WORK_SHIFTS[s2] not in allowed:
+                        continue
+                    for g in range(min(max_gap, t) + 1):  # g = 前面連續 OFF 天數
+                        t1 = t - g - 1
+                        if t1 < 0:
+                            continue
+                        for s1 in range(3):
+                            if s1 == s2:
+                                continue
+                            if WORK_SHIFTS[s1] not in allowed:
+                                continue
+                            # t1=s1, t1+1..t-1 全為 OFF, t=s2
+                            parts = ([b[m][t1][s1]]
+                                     + [b[m][t1 + k][3] for k in range(1, g + 1)]
+                                     + [b[m][t][s2]])
+                            sw = model.new_bool_var(f"gsw_{m}_{t}_{g}_{s1}_{s2}")
+                            model.add(sw >= sum(parts) - (g + 1))
+                            penalties.append(sw * 2)
 
     model.minimize(sum(penalties))
 
