@@ -596,6 +596,7 @@ def generate_schedule(
             model.add_exactly_one(b[m][t])
 
         # ── 鎖定已確認班 / 特休 / 指定休
+        locked_off_days_m: set[int] = set()  # 記錄指定 OFF 的天索引（不含特休/員旅）
         for t, d_str in enumerate(cycle_dates):
             key = (uid, d_str)
             if key not in existing:
@@ -613,19 +614,20 @@ def generate_schedule(
                 shift = "D"
 
             if shift in PRIORITY_OFF:
-                # 特休/員旅：最高順位，一定保留
-                si = SI.get(shift, 3)
-                if si >= len(SI): si = 3  # 不在清單的視同 OFF
-                model.add(x[m][t] == 3)  # 記為 OFF（不計臨床人力）
+                # 特休/員旅：最高順位，一定保留，不占指定休/自動休名額
+                model.add(x[m][t] == 3)
                 continue
 
             if confirmed and not overwrite_confirmed:
                 si = SI.get(shift, 3)
                 model.add(x[m][t] == si)
+                if si == 3:
+                    locked_off_days_m.add(t)  # 已確認的 OFF = 指定休
                 continue
 
             if lock_designated_off and shift == "OFF":
                 model.add(x[m][t] == 3)
+                locked_off_days_m.add(t)
 
         # ── 允許班種限制（依輪班屬性）
         allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
@@ -714,6 +716,15 @@ def generate_schedule(
                 # 不能同時都是 OFF
                 model.add(b[m][sat_idx][3] + b[m][sun_idx][3] <= 1)
 
+        # ── 規則 6/7：每週 OFF 天數上限
+        for ws, we in weeks:
+            # 規則 7：含指定休每週最多 weekly_max_off_total 天（預設 3）
+            model.add(sum(b[m][t][3] for t in range(ws, we+1)) <= weekly_max_off_total)
+            # 規則 6：自動休（排除已鎖定的指定休）每週最多 weekly_max_off_auto 天（預設 2）
+            auto_off_in_week = [b[m][t][3] for t in range(ws, we+1) if t not in locked_off_days_m]
+            if auto_off_in_week:
+                model.add(sum(auto_off_in_week) <= weekly_max_off_auto)
+
     # ── 硬規則 1：每班每日至少 1 leader + 1 (leader or second)，不同人
     leaders = [i for i, n in enumerate(nurses) if n.get("level") == "leader"]
     seconds = [i for i, n in enumerate(nurses) if n.get("level") in ("leader", "second")]
@@ -744,7 +755,9 @@ def generate_schedule(
                 for s2 in range(3):
                     if s1 != s2 and WORK_SHIFTS[s1] in allowed and WORK_SHIFTS[s2] in allowed:
                         switch = model.new_bool_var(f"sw_{m}_{t}_{s1}_{s2}")
-                        model.add_bool_and([b[m][t][s1], b[m][t+1][s2]]).only_enforce_if(switch)
+                        # switch=1 iff (day t = s1 AND day t+1 = s2)
+                        # 透過 >= 讓 minimize 自動把 switch 壓到 0（即避免切換）
+                        model.add(switch >= b[m][t][s1] + b[m][t+1][s2] - 1)
                         penalties.append(switch)
 
     model.minimize(sum(penalties))
