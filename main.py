@@ -657,19 +657,23 @@ def generate_schedule(
         model.add(total_nv >= max(0, nv_cnt - 2))
         model.add(total_nv <= nv_cnt + 2)
 
-        # ── 硬規則 2：反向班禁止，中間必須是 OFF
-        # E→D: E 之後 1 天必須 OFF，第 2 天才能排 D
-        # N→E: N 之後 1 天必須 OFF
-        # N→D: N 之後 2 天都必須 OFF，第 3 天才能排 D
+        # ── 硬規則 2：反向班禁止
+        # 允許模式：E, OFF, D  /  N, OFF, E  /  N, OFF, OFF, D
+        # 禁止模式（直接或插非 OFF 換班）：
+        #   E→D：E 後 1 天不能是 D（需先有 1 天 OFF）
+        #   N→E：N 後 1 天不能是 E（需先有 1 天 OFF）
+        #   N→D：N 後 1 天或 2 天都不能是 D（需先有 2 天 OFF）
         if no_reverse:
             for t in range(n - 1):
-                # E 後一天必須 OFF
-                model.add(b[m][t+1][3] == 1).only_enforce_if(b[m][t][1])
-                # N 後一天必須 OFF
-                model.add(b[m][t+1][3] == 1).only_enforce_if(b[m][t][2])
+                # E 後緊接 D 禁止（E→D 需要 1 天 OFF 間隔）
+                model.add(b[m][t+1][0] == 0).only_enforce_if(b[m][t][1])
+                # N 後緊接 E 禁止（N→E 需要 1 天 OFF 間隔）
+                model.add(b[m][t+1][1] == 0).only_enforce_if(b[m][t][2])
+                # N 後緊接 D 禁止（N→D 需要 2 天 OFF 間隔）
+                model.add(b[m][t+1][0] == 0).only_enforce_if(b[m][t][2])
             for t in range(n - 2):
-                # N 後第二天也必須 OFF
-                model.add(b[m][t+2][3] == 1).only_enforce_if(b[m][t][2])
+                # N 後第 2 天也不能是 D（1 天 OFF 不夠，要 2 天）
+                model.add(b[m][t+2][0] == 0).only_enforce_if(b[m][t][2])
 
         # ── 硬規則 3：每週至少一天休假（固定啟用）
         for ws, we in weeks:
