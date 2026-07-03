@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, date as date_type
 import math, os
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from ortools.sat.python import cp_model
 
 load_dotenv()
 
@@ -445,12 +446,12 @@ def generate_schedule(
     current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
 ):
     """
-    順班演算法：
-    1. 依輪班屬性與比例，把同種班排成連續區塊，OFF 均勻穿插於各區塊中
-    2. 第二階段：逐日檢查 D/E/N 人數，不足時從 OFF 護理師補調
-    固定班（固定D/E/N）整週期幾乎只排同一種班，僅在人力缺口下才少數例外
+    CP-SAT 排班演算法，遵守以下規則：
+    硬規則：leader 配置、反向班、每週至少休1天、每週至多兩種班別、連班上限
+    軟規則：順班（同種班連排）、固定班不切換、符合各班人數需求
+    休假規則：週期首週末不同時休、每週休假上限、一例一休、特休最高順位
     """
-    uid = current_user.get("sub")
+    operator_uid = current_user.get("sub")
 
     # ── 讀取規則
     rules_res = supabase.table("rules").select("*").limit(1).execute()
@@ -461,6 +462,8 @@ def generate_schedule(
     cycle      = rules.get("cycle", {})
     scheduling = rules.get("scheduling", {})
     ratio      = rules.get("ratio", {})
+    ratio_overrides_list = rules.get("ratio_overrides", [])
+    ratio_overrides = {o["nurse_uid"]: o["ratio"] for o in ratio_overrides_list}
 
     start_str = cycle.get("start_date")
     end_str   = cycle.get("end_date")
@@ -474,176 +477,354 @@ def generate_schedule(
         for i in range((end_d - start_d).days + 1)
     ]
     n = len(cycle_dates)
+    weekdays = [(start_d + timedelta(days=i)).weekday() for i in range(n)]
+    # weekday(): Mon=0 … Sat=5, Sun=6
 
-    max_consec  = int(scheduling.get("max_consecutive_work", 5))
-    daily_d     = int(scheduling.get("daily_d", 3))
-    daily_e     = int(scheduling.get("daily_e", 3))
-    daily_n     = int(scheduling.get("daily_n", 3))
-    no_reverse  = bool(scheduling.get("no_reverse_shift", True))
+    # ── 規則參數
+    max_consec   = int(scheduling.get("max_consecutive_work", 5))
+    daily_d      = int(scheduling.get("daily_d", 3))
+    daily_e      = int(scheduling.get("daily_e", 3))
+    daily_n      = int(scheduling.get("daily_n", 3))
+    no_reverse   = bool(scheduling.get("no_reverse_shift", True))
+    restrict_first_weekend = bool(scheduling.get("restrict_first_weekend", True))
+    one_in_seven = bool(scheduling.get("one_in_seven", False))  # 一例一休
+    lock_designated_off = bool(scheduling.get("lock_designated_off", False))
+    weekly_max_off_auto  = int(scheduling.get("weekly_max_off_auto", 2))   # 自動休每週上限
+    weekly_max_off_total = int(scheduling.get("weekly_max_off_total", 3))  # 含指定休每週上限
     holiday_days = int(cycle.get("holiday_days", 0))
-    full_off    = min(8 + holiday_days, 13)
-    part_off    = min(16 + holiday_days, 21)
+    full_off  = min(8 + holiday_days, 13)
+    part_off  = min(16 + holiday_days, 21)
+
+    # 班別視同 D 的特殊班（不計臨床人力，但算上班日）
+    ADMIN_SHIFTS = {"會", "公", "書記"}
+    # 特休 / 員旅 → 最高順位不被覆蓋
+    PRIORITY_OFF = {"V", "員"}
 
     # ── 讀取護理師
     nurses_res = supabase.table("users").select(
         "uid, attr, halftime, level"
-    ).in_("role", ["nurse", "dual"]).execute()
+    ).in_("role", ["nurse", "dual"]).order("sort_order").execute()
     nurses = nurses_res.data or []
     if not nurses:
         raise HTTPException(400, "尚無護理師帳號")
+    M = len(nurses)
+    nid = {n["uid"]: i for i, n in enumerate(nurses)}
 
-    # ── 計算各屬性的班別分配數量
-    def shift_counts(attr: str, work_days: int) -> tuple[int, int, int]:
-        """回傳 (d, e, n) 各班天數"""
+    # ── 讀取已確認班 / 指定班（含特休、指定休）
+    existing_res = supabase.table("shifts").select("nurse_uid, date, shift, confirmed") \
+        .gte("date", start_str).lte("date", end_str).execute()
+    existing: dict[tuple, dict] = {
+        (r["nurse_uid"], r["date"]): r
+        for r in (existing_res.data or [])
+    }
+
+    # ── helper：計算各護理師每週的 ISO 週邊界
+    def week_ranges(dates: list[str]) -> list[tuple[int,int]]:
+        """回傳 [(start_i, end_i)] 代表週一到週日的日期索引範圍（週期內）"""
+        weeks = []
+        i = 0
+        while i < len(dates):
+            wd = weekdays[i]
+            week_start = i - wd  # Mon of that week (may be < 0)
+            week_end   = week_start + 6
+            # 夾到週期內
+            ws = max(0, week_start)
+            we = min(len(dates) - 1, week_end)
+            weeks.append((ws, we))
+            # 跳到下個週一
+            i = week_end + 1
+        return weeks
+    weeks = week_ranges(cycle_dates)
+
+    # ── 計算各護理師應排班次數（依比例）
+    def shift_counts(attr: str, work_days: int, nurse_uid: str) -> tuple[int,int,int]:
         if attr == "固定D": return (work_days, 0, 0)
         if attr == "固定E": return (0, work_days, 0)
         if attr == "固定N": return (0, 0, work_days)
-
-        def r(key): return max(1, int(ratio.get(key, 1)))
-
+        ov = ratio_overrides.get(nurse_uid, {})
+        def r(key, default=1): return max(1, int(ov.get(key, ratio.get(key, default))))
         if attr == "輪班DE":
-            rd, re = r("de_d"), r("de_e"); tot = rd + re
-            d = round(work_days * rd / tot); return (d, work_days - d, 0)
+            rd, re = r("D",1), r("E",1); tot = rd+re
+            d = round(work_days*rd/tot); return (d, work_days-d, 0)
         if attr == "輪班EN":
-            re, rn = r("en_e"), r("en_n"); tot = re + rn
-            e = round(work_days * re / tot); return (0, e, work_days - e)
+            re, rn = r("E",1), r("N",1); tot = re+rn
+            e = round(work_days*re/tot); return (0, e, work_days-e)
         if attr == "輪班DN":
-            rd, rn = r("dn_d"), r("dn_n"); tot = rd + rn
-            d = round(work_days * rd / tot); return (d, 0, work_days - d)
-        # 輪班DEN（預設）
-        rd, re, rn = r("den_d"), r("den_e"), r("den_n"); tot = rd + re + rn
-        d = round(work_days * rd / tot); e = round(work_days * re / tot)
-        return (d, e, work_days - d - e)
+            rd, rn = r("D",1), r("N",1); tot = rd+rn
+            d = round(work_days*rd/tot); return (d, 0, work_days-d)
+        rd, re, rn = r("D",1), r("E",1), r("N",1); tot = rd+re+rn
+        d = round(work_days*rd/tot); e = round(work_days*re/tot)
+        return (d, e, work_days-d-e)
 
-    # ── 建立單一區塊（shift × work_cnt，穿插 off_cnt 天 OFF）
-    def build_block(shift: str, work_cnt: int, off_cnt: int) -> list[str]:
-        """
-        填法：連續排到 max_consec 上限就插 OFF，
-        其餘 OFF 均勻分佈（避免 OFF 全堆到最後）
-        """
-        block: list[str] = []
-        rem_w, rem_o = work_cnt, off_cnt
-        consec = 0
-        while rem_w > 0 or rem_o > 0:
-            if consec >= max_consec and rem_o > 0:
-                block.append("OFF"); rem_o -= 1; consec = 0
-            elif rem_w > 0:
-                block.append(shift); rem_w -= 1; consec += 1
-            else:
-                block.append("OFF"); rem_o -= 1; consec = 0
-        return block
+    # ── 允許班種（依輪班屬性）
+    SHIFT_ALLOWED: dict[str, list[str]] = {
+        "固定D":   ["D"],
+        "固定E":   ["E"],
+        "固定N":   ["N"],
+        "輪班DE":  ["D","E"],
+        "輪班EN":  ["E","N"],
+        "輪班DN":  ["D","N"],
+        "輪班DEN": ["D","E","N"],
+    }
+    WORK_SHIFTS = ["D","E","N"]
+    SI = {s: i for i, s in enumerate(["D","E","N","OFF"])}  # shift index
 
-    # ── 產生單人順班排程（區塊式）
-    def smooth_sched(off_days: int, d: int, e: int, nv: int) -> list[str]:
-        work_days = d + e + nv
-        blocks = [(s, c) for s, c in [("D", d), ("E", e), ("N", nv)] if c > 0]
-        if not blocks:
-            return ["OFF"] * (work_days + off_days)
+    # ── CP-SAT 模型
+    model = cp_model.CpModel()
 
-        sched: list[str] = []
-        rem_off = off_days
-        for bi, (sh, wc) in enumerate(blocks):
-            # 依比例分配 OFF 給每個區塊，最後一塊拿剩下的
-            block_off = rem_off if bi == len(blocks) - 1 \
-                        else math.floor(off_days * wc / work_days)
-            rem_off -= block_off
-            sched.extend(build_block(sh, wc, block_off))
-        return sched
+    # x[m][t] ∈ {0,1,2,3} → D/E/N/OFF
+    x: list[list] = [
+        [model.new_int_var(0, 3, f"x_{m}_{t}") for t in range(n)]
+        for m in range(M)
+    ]
+    # bool 變數：is_shift[m][t][s]
+    b: list[list[list]] = [
+        [[model.new_bool_var(f"b_{m}_{t}_{s}") for s in range(4)] for t in range(n)]
+        for m in range(M)
+    ]
 
-    # ── Phase 1：每人個別產生順班排程
+    for m in range(M):
+        nurse = nurses[m]
+        attr  = nurse.get("attr") or "輪班DEN"
+        is_ht = nurse.get("halftime", False)
+        lvl   = nurse.get("level", "member")
+        uid   = nurse["uid"]
+
+        # x ↔ b 對應
+        for t in range(n):
+            model.add(x[m][t] == sum(s * b[m][t][s] for s in range(4)))
+            model.add_exactly_one(b[m][t])
+
+        # ── 鎖定已確認班 / 特休 / 指定休
+        for t, d_str in enumerate(cycle_dates):
+            key = (uid, d_str)
+            if key not in existing:
+                continue
+            row = existing[key]
+            shift = row.get("shift") or "OFF"
+            confirmed = row.get("confirmed", False)
+
+            # 半職視同 OFF
+            if shift == "半":
+                shift = "OFF"
+
+            # 行政班視同 D（不計臨床人力，但視同上班）
+            if shift in ADMIN_SHIFTS:
+                shift = "D"
+
+            if shift in PRIORITY_OFF:
+                # 特休/員旅：最高順位，一定保留
+                si = SI.get(shift, 3)
+                if si >= len(SI): si = 3  # 不在清單的視同 OFF
+                model.add(x[m][t] == 3)  # 記為 OFF（不計臨床人力）
+                continue
+
+            if confirmed and not overwrite_confirmed:
+                si = SI.get(shift, 3)
+                model.add(x[m][t] == si)
+                continue
+
+            if lock_designated_off and shift == "OFF":
+                model.add(x[m][t] == 3)
+
+        # ── 允許班種限制（依輪班屬性）
+        allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
+        allowed_si = set(SI[s] for s in allowed) | {3}  # OFF 永遠允許
+        for t in range(n):
+            for s in range(4):
+                if s not in allowed_si:
+                    model.add(b[m][t][s] == 0)
+
+        # ── 休假天數
+        off_days = part_off if is_ht else full_off
+        off_days = min(off_days, n - 1)
+        work_days = n - off_days
+        d_cnt, e_cnt, nv_cnt = shift_counts(attr, work_days, uid)
+
+        # 軟約束：目標班次數（允許偏差 ±2）
+        total_d = sum(b[m][t][0] for t in range(n))
+        total_e = sum(b[m][t][1] for t in range(n))
+        total_nv = sum(b[m][t][2] for t in range(n))
+        total_off = sum(b[m][t][3] for t in range(n))
+        model.add(total_off >= off_days - 2)
+        model.add(total_off <= off_days + 2)
+        model.add(total_d  >= max(0, d_cnt  - 2))
+        model.add(total_d  <= d_cnt  + 2)
+        model.add(total_e  >= max(0, e_cnt  - 2))
+        model.add(total_e  <= e_cnt  + 2)
+        model.add(total_nv >= max(0, nv_cnt - 2))
+        model.add(total_nv <= nv_cnt + 2)
+
+        # ── 硬規則 2：反向班禁止（含隔天規則）
+        # E→D: 禁止（隔1天 OFF 才行 → 兩天後才能 D）
+        # N→E: 禁止
+        # N→D: 禁止（且隔1天 OFF 後也不行，需隔2天）
+        if no_reverse:
+            for t in range(n - 1):
+                # E 後不能直接 D
+                model.add(b[m][t+1][0] == 0).only_enforce_if(b[m][t][1])
+                # N 後不能直接 D 或 E
+                model.add(b[m][t+1][0] == 0).only_enforce_if(b[m][t][2])
+                model.add(b[m][t+1][1] == 0).only_enforce_if(b[m][t][2])
+            for t in range(n - 2):
+                # N 後隔一天（無論 OFF 或其他）仍不能排 D
+                model.add(b[m][t+2][0] == 0).only_enforce_if(b[m][t][2])
+
+        # ── 硬規則 3：每週至少一天休假（固定啟用）
+        for ws, we in weeks:
+            model.add(sum(b[m][t][3] for t in range(ws, we+1)) >= 1)
+
+        # ── 硬規則 4：每週 D/E/N 至多兩種班別
+        for ws, we in weeks:
+            has_D = model.new_bool_var(f"hasD_{m}_{ws}")
+            has_E = model.new_bool_var(f"hasE_{m}_{ws}")
+            has_N = model.new_bool_var(f"hasN_{m}_{ws}")
+            wlen = we - ws + 1
+            model.add(sum(b[m][t][0] for t in range(ws, we+1)) >= 1).only_enforce_if(has_D)
+            model.add(sum(b[m][t][0] for t in range(ws, we+1)) == 0).only_enforce_if(has_D.negated())
+            model.add(sum(b[m][t][1] for t in range(ws, we+1)) >= 1).only_enforce_if(has_E)
+            model.add(sum(b[m][t][1] for t in range(ws, we+1)) == 0).only_enforce_if(has_E.negated())
+            model.add(sum(b[m][t][2] for t in range(ws, we+1)) >= 1).only_enforce_if(has_N)
+            model.add(sum(b[m][t][2] for t in range(ws, we+1)) == 0).only_enforce_if(has_N.negated())
+            model.add(has_D + has_E + has_N <= 2)
+
+        # ── 連班上限
+        for t in range(n - max_consec):
+            model.add(
+                sum(b[m][t+k][s] for k in range(max_consec+1) for s in range(3)) <= max_consec
+            )
+
+        # ── 一例一休（可勾選）：每週至少 2 天休假
+        if one_in_seven:
+            for ws, we in weeks:
+                model.add(sum(b[m][t][3] for t in range(ws, we+1)) >= 2)
+
+        # ── 週期首個週末不同時休（restrict_first_weekend）
+        if restrict_first_weekend:
+            sat_idx, sun_idx = None, None
+            for t, d_str in enumerate(cycle_dates):
+                d_obj = start_d + timedelta(days=t)
+                if d_obj.weekday() == 5 and sat_idx is None:
+                    sat_idx = t
+                if d_obj.weekday() == 6 and sun_idx is None:
+                    sun_idx = t
+                if sat_idx is not None and sun_idx is not None:
+                    break
+            if sat_idx is not None and sun_idx is not None:
+                # 不能同時都是 OFF
+                model.add(b[m][sat_idx][3] + b[m][sun_idx][3] <= 1)
+
+    # ── 硬規則 1：每班每日至少 1 leader + 1 (leader or second)，不同人
+    leaders = [i for i, n in enumerate(nurses) if n.get("level") == "leader"]
+    seconds = [i for i, n in enumerate(nurses) if n.get("level") in ("leader", "second")]
+
+    for t in range(n):
+        for si, req in [(0, daily_d), (1, daily_e), (2, daily_n)]:
+            if req == 0:
+                continue
+            # 至少 req 人上班
+            model.add(sum(b[m][t][si] for m in range(M)) >= req)
+            # 至少 1 leader
+            if leaders:
+                model.add(sum(b[m][t][si] for m in leaders) >= 1)
+            # 至少 2 人達 leader/second 層級（若有足夠人員）
+            if len(seconds) >= 2:
+                model.add(sum(b[m][t][si] for m in seconds) >= 2)
+
+    # ── 軟規則：順班目標（同種班連續排列）
+    # 懲罰班別切換（相鄰兩天不同班種）
+    penalties = []
+    for m in range(M):
+        attr = nurses[m].get("attr") or "輪班DEN"
+        allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
+        if len(allowed) <= 1:
+            continue  # 固定班不需要順班懲罰
+        for t in range(n - 1):
+            for s1 in range(3):
+                for s2 in range(3):
+                    if s1 != s2 and WORK_SHIFTS[s1] in allowed and WORK_SHIFTS[s2] in allowed:
+                        switch = model.new_bool_var(f"sw_{m}_{t}_{s1}_{s2}")
+                        model.add_bool_and([b[m][t][s1], b[m][t+1][s2]]).only_enforce_if(switch)
+                        penalties.append(switch)
+
+    model.minimize(sum(penalties))
+
+    # ── 求解
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 60
+    solver.parameters.num_workers = 4
+    status = solver.solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        # 回傳具體的違規原因
+        violations = []
+        if not leaders:
+            violations.append("沒有設定 leader 層級的護理師")
+        violations.append("人力可能不足以滿足每日每班最低人數需求")
+        raise HTTPException(
+            400,
+            "⚠ 無法生成符合所有規則的班表。原因可能包含：" +
+            "；".join(violations) if violations else
+            "人力配置與規則限制衝突，請檢查人數設定、反向班規則或連班上限。"
+        )
+
+    # ── 解析結果
+    SHIFT_NAMES = ["D", "E", "N", "OFF"]
     schedules: dict[str, list[str]] = {}
-    nurse_attr: dict[str, str] = {}
-    for nurse in nurses:
-        attr       = nurse.get("attr") or "輪班DEN"
-        nurse_attr[nurse["uid"]] = attr
-        off_days   = part_off if nurse.get("halftime") else full_off
-        off_days   = min(off_days, n - 1)
-        work_days  = n - off_days
-        d, e, nv   = shift_counts(attr, work_days)
-        sched      = smooth_sched(off_days, d, e, nv)
-        # 補齊或截斷至 n 天
-        sched = (sched + ["OFF"] * n)[:n]
+    for m, nurse in enumerate(nurses):
+        sched = [SHIFT_NAMES[solver.value(x[m][t])] for t in range(n)]
+        # 還原特休、指定休（不被 CP-SAT 覆蓋，從 existing 讀回）
+        for t, d_str in enumerate(cycle_dates):
+            key = (nurse["uid"], d_str)
+            if key in existing:
+                orig = existing[key].get("shift") or "OFF"
+                if orig in PRIORITY_OFF:
+                    sched[t] = orig
+                elif orig in ADMIN_SHIFTS:
+                    sched[t] = orig  # 行政班保留原班碼
+                elif orig == "半":
+                    sched[t] = "半"
         schedules[nurse["uid"]] = sched
 
-    # ── Phase 2：逐日調整，補足 D/E/N 人數缺口
-    SHIFT_ALLOWED: dict[str, set[str]] = {
-        "固定D":  {"D"},
-        "固定E":  {"E"},
-        "固定N":  {"N"},
-        "輪班DE": {"D", "E"},
-        "輪班EN": {"E", "N"},
-        "輪班DN": {"D", "N"},
-        "輪班DEN":{"D", "E", "N"},
-    }
-    REVERSE_FORBIDDEN: dict[str, set[str]] = {
-        "N": {"D", "E"},  # 大夜後不可排白班或小夜
-        "E": {"D"},       # 小夜後不可排白班
-    }
-
-    for day_i in range(n):
-        for target, req in [("D", daily_d), ("E", daily_e), ("N", daily_n)]:
-            cur = sum(1 for uid in schedules if schedules[uid][day_i] == target)
-            if cur >= req:
-                continue
-            # 從 OFF 護理師中挑選可補班的
-            for nurse in nurses:
-                uid = nurse["uid"]
-                if schedules[uid][day_i] != "OFF":
-                    continue
-                allowed = SHIFT_ALLOWED.get(nurse_attr[uid], {"D","E","N"})
-                if target not in allowed:
-                    continue
-                # 反向班檢查
-                if no_reverse and day_i > 0:
-                    prev = schedules[uid][day_i - 1]
-                    if target in REVERSE_FORBIDDEN.get(prev, set()):
-                        continue
-                schedules[uid][day_i] = target
-                cur += 1
-                if cur >= req:
-                    break
-
-    # ── Phase 3：寫入資料庫
-    existing_res = supabase.table("shifts").select("nurse_uid, date, confirmed") \
-        .gte("date", start_str).lte("date", end_str).execute()
+    # ── 寫入資料庫
     existing_map: dict[str, bool] = {
         f"{r['nurse_uid']}_{r['date']}": r.get("confirmed", False)
         for r in (existing_res.data or [])
     }
-
     to_insert, to_update = [], []
     for nurse_uid, sched in schedules.items():
         for i, shift in enumerate(sched):
             d_str = cycle_dates[i]
             key   = f"{nurse_uid}_{d_str}"
             if shift == "OFF":
-                continue  # 休假不寫入，留空即可
+                continue  # OFF 不寫入，留空
             if key in existing_map:
                 if not overwrite_confirmed and existing_map[key]:
-                    continue  # 已確認班不覆蓋
+                    continue
                 to_update.append({"nurse_uid": nurse_uid, "date": d_str, "shift": shift})
             else:
                 to_insert.append({
-                    "code":      key,
-                    "label":     shift,
-                    "nurse_uid": nurse_uid,
-                    "date":      d_str,
-                    "shift":     shift,
-                    "confirmed": False,
-                    "updated_by": uid,
+                    "code":       key,
+                    "label":      shift,
+                    "nurse_uid":  nurse_uid,
+                    "date":       d_str,
+                    "shift":      shift,
+                    "confirmed":  False,
+                    "updated_by": operator_uid,
                 })
 
     if to_insert:
         supabase.table("shifts").insert(to_insert).execute()
     for row in to_update:
         supabase.table("shifts").update({
-            "shift": row["shift"], "confirmed": False, "updated_by": uid,
+            "shift": row["shift"], "confirmed": False, "updated_by": operator_uid,
             "updated_at": datetime.utcnow().isoformat(),
         }).eq("nurse_uid", row["nurse_uid"]).eq("date", row["date"]).execute()
 
     total = len(to_insert) + len(to_update)
     return {
         "message": f"✓ 已生成 {len(nurses)} 位護理師的班表（共 {total} 格）",
+        "solver_status": solver.status_name(status),
         "nurses": len(nurses), "cells": total,
         "inserted": len(to_insert), "updated": len(to_update),
     }
