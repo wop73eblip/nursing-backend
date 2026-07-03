@@ -487,7 +487,7 @@ def generate_schedule(
     daily_n      = int(scheduling.get("daily_n", 3))
     no_reverse   = bool(scheduling.get("no_reverse_shift", True))
     restrict_first_weekend = bool(scheduling.get("restrict_first_weekend", True))
-    one_in_seven = bool(scheduling.get("one_in_seven", False))  # 一例一休
+    one_in_seven = bool(scheduling.get("one_in_seven", True))   # 一例一休
     lock_first_day       = bool(scheduling.get("lock_first_day", True))
     lock_designated_off  = bool(scheduling.get("lock_designated_off", True))
     weekly_max_off_auto  = int(scheduling.get("weekly_max_off_auto", 2))   # 自動休連續天數上限
@@ -747,11 +747,16 @@ def generate_schedule(
                 # 不能同時都是 OFF
                 model.add(b[m][sat_idx][3] + b[m][sun_idx][3] <= 1)
 
-        # ── 規則 7：每週應休（不含 LEAVE_ADJUST）總天數上限
-        for ws, we in weeks:
-            reg_off_wk = [b[m][t][3] for t in range(ws, we+1) if t not in leave_adjust_days_m]
-            if reg_off_wk:
-                model.add(sum(reg_off_wk) <= weekly_max_off_total)
+        # ── 規則 7：連續 OFF 總天數上限（指定休 + 自動休，不含 LEAVE_ADJUST）
+        # 滑動視窗：任意 weekly_max_off_total+1 天的視窗內（無 LEAVE_ADJUST 介入時），OFF 不得全滿
+        for t in range(n - weekly_max_off_total):
+            # 若視窗內有 LEAVE_ADJUST，該天自然中斷連休，跳過
+            if any((t + k) in leave_adjust_days_m for k in range(weekly_max_off_total + 1)):
+                continue
+            model.add(
+                sum(b[m][t + k][3] for k in range(weekly_max_off_total + 1))
+                <= weekly_max_off_total
+            )
 
         # ── 規則 6（新）：自動休連續天數不超過 weekly_max_off_auto 天
         for t in range(n - weekly_max_off_auto):
