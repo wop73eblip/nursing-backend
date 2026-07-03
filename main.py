@@ -780,7 +780,7 @@ def generate_schedule(
                 model.add(sum(b[m][t][si] for m in leaders) >= 1)
             # 至少 2 人達 leader/second 層級（若有足夠人員）
             if len(seconds) >= 2:
-                model.add(sum(b[m][t][si] for m in seconds) >= 2)
+                model.add(sum(b[m][t][si] for m in leaders) + sum(b[m][t][si] for m in seconds) >= 2)
 
     # ── 軟規則：順班目標 + 固定班偏離懲罰
     FIX_PENALTY = 20  # 固定班偏離懲罰（遠高於換班懲罰 1）
