@@ -660,12 +660,10 @@ def generate_schedule(
                     locked_off_days_m.add(t)
                 continue
 
-            # 第一天鎖定
-            if lock_first_day and t == 0:
+            # 第一天鎖定（只鎖工作班，休假讓 CP-SAT 自行決定）
+            if lock_first_day and t == 0 and shift not in REST_CODES and shift not in LEAVE_ADJUST and shift != "OFF":
                 si = SI.get(shift, 3)
                 model.add(x[m][t] == si)
-                if si == 3:
-                    locked_off_days_m.add(t)
                 continue
 
             # 指定休不可覆蓋
@@ -685,7 +683,13 @@ def generate_schedule(
 
         # ── 休假天數（LEAVE_ADJUST 不計入應休名額）
         la_count = len(leave_adjust_days_m)
-        off_days = part_off if is_ht else full_off
+        guaranteed_off = part_off if is_ht else full_off
+        # 根據實際人數動態計算每人所需 OFF，避免上限過嚴導致 INFEASIBLE
+        # 總 OFF 名額 = 總人天 - 每天所需人力 × 天數；每人平均 = 總 OFF / 人數
+        _required_per_day = daily_d + daily_e + daily_n
+        _total_off_needed = max(0, M * (n - la_count) - _required_per_day * n)
+        _expected_off = (_total_off_needed + M - 1) // M  # ceiling
+        off_days = max(guaranteed_off, _expected_off)
         off_days = min(off_days, n - la_count - 1)
         effective_work_days = max(0, n - off_days - la_count)
         d_cnt, e_cnt, nv_cnt = shift_counts(attr, effective_work_days, uid)
@@ -702,12 +706,9 @@ def generate_schedule(
         off_slack_vars.append((m, off_slack))
         model.add(sum(free_off) >= off_days - 2 - off_slack)
         model.add(sum(free_off) <= off_days + 2)
-        model.add(total_d  >= max(0, d_cnt  - 2))
-        model.add(total_d  <= d_cnt  + 2)
-        model.add(total_e  >= max(0, e_cnt  - 2))
-        model.add(total_e  <= e_cnt  + 2)
-        model.add(total_nv >= max(0, nv_cnt - 2))
-        model.add(total_nv <= nv_cnt + 2)
+        # 班次分配：移除硬約束（上限與下限）
+        # 硬約束導致人少時 INFEASIBLE（上限）或班種分配過緊（下限）
+        # 由每日 daily 等式約束（全局總量）+ FIX_PENALTY 軟懲罰（個人偏離）來保證分配均衡
 
         # ── 硬規則 2：反向班禁止
         # 允許模式：E, OFF, D  /  N, OFF, E  /  N, OFF, OFF, D
@@ -834,33 +835,105 @@ def generate_schedule(
 
         leave_adjust_per_m[m] = leave_adjust_days_m
 
-    # ── 硬規則 1：每班每日至少 1 leader + 1 (leader or second)，不同人
+    # ── 硬規則 1：每班每日剛好 req 人；leader/second 為軟約束（懲罰），避免人力不足時 INFEASIBLE
     leaders = [i for i, n in enumerate(nurses) if n.get("level") == "leader"]
     seconds = [i for i, n in enumerate(nurses) if n.get("level") in ("leader", "second")]
+
+    SHIFT_ALLOWED_MAP = {
+        "固定D": ["D"], "固定E": ["E"], "固定N": ["N"],
+        "輪班DE": ["D", "E"], "輪班EN": ["E", "N"], "輪班DN": ["D", "N"], "輪班DEN": ["D", "E", "N"],
+    }
+    _WORK_SHIFTS_LIST = ["D", "E", "N"]
+    # 各班別有能力上班的 leader/second 清單（用於檢查可行性）
+    _capable_leaders = {
+        si: [m for m in leaders if _WORK_SHIFTS_LIST[si] in SHIFT_ALLOWED_MAP.get(nurses[m].get("attr") or "輪班DEN", _WORK_SHIFTS_LIST)]
+        for si in range(3)
+    }
+    _capable_seconds = {
+        si: [m for m in seconds if _WORK_SHIFTS_LIST[si] in SHIFT_ALLOWED_MAP.get(nurses[m].get("attr") or "輪班DEN", _WORK_SHIFTS_LIST)]
+        for si in range(3)
+    }
+    # 各班別有能力的 leader 數量 = 若 <= 1，強制排班會造成 INFEASIBLE（那唯一 leader 無法休假）
+    # 改為高懲罰軟約束：缺 1 leader 罰 50，缺 leader+second 各罰 30
+    LEADER_PENALTY  = 200   # 缺 leader 高懲罰，盡量安排 leader；不設為硬約束以免人少時 INFEASIBLE
+    SECOND_PENALTY  = 100
 
     for t in range(n):
         for si, req in [(0, daily_d), (1, daily_e), (2, daily_n)]:
             if req == 0:
                 continue
-            # 剛好 req 人上班
             model.add(sum(b[m][t][si] for m in range(M)) == req)
-            # 至少 1 leader
-            if leaders:
-                model.add(sum(b[m][t][si] for m in leaders) >= 1)
-            # 至少 2 人達 leader/second 層級（若有足夠人員）
-            if len(seconds) >= 2:
-                model.add(sum(b[m][t][si] for m in leaders) + sum(b[m][t][si] for m in seconds) >= 2)
 
-    # ── 軟規則：順班目標 + 固定班偏離懲罰
+    # ── 軟規則：順班目標 + 固定班偏離懲罰 + leader/second 出勤偏好
     FIX_PENALTY = 20
     penalties = []
+    # leader/second 軟懲罰（先佔位，懲罰值後加入）
+    leader_miss_vars: list[tuple[object, int]] = []   # (bool_var, penalty)
+    for t in range(n):
+        for si in range(3):
+            req = [daily_d, daily_e, daily_n][si]
+            if req == 0:
+                continue
+            # 至少 1 leader（軟）
+            cl = _capable_leaders[si]
+            if cl:
+                miss_l = model.new_bool_var(f"miss_leader_{t}_{si}")
+                # miss_l = 1 iff no capable leader works this shift this day
+                model.add(sum(b[m][t][si] for m in cl) >= 1 - miss_l)
+                model.add(miss_l <= 1 - sum(b[m][t][si] for m in cl) // max(1, len(cl)))
+                # simpler formulation
+                # miss_l == 1  <=>  sum == 0
+                model.add(sum(b[m][t][si] for m in cl) == 0).only_enforce_if(miss_l)
+                model.add(sum(b[m][t][si] for m in cl) >= 1).only_enforce_if(miss_l.negated())
+                leader_miss_vars.append((miss_l, LEADER_PENALTY))
+            # 至少 2 capable leaders/seconds（軟）
+            cs = _capable_seconds[si]
+            if len(cs) >= 2:
+                miss_s = model.new_bool_var(f"miss_second_{t}_{si}")
+                model.add(sum(b[m][t][si] for m in cs) == 0).only_enforce_if(miss_s)
+                model.add(sum(b[m][t][si] for m in cs) >= 1).only_enforce_if(miss_s.negated())
+                leader_miss_vars.append((miss_s, SECOND_PENALTY))
     # off_slack 懲罰在此加入（必須在 penalties = [] 之後）
     for _, slack_var in off_slack_vars:
         penalties.append(slack_var * 200)  # 遠高於切換懲罰，只在人力不足時才縮減
+    # leader/second 軟約束懲罰
+    for miss_var, pen in leader_miss_vars:
+        penalties.append(miss_var * pen)
     for m in range(M):
         attr = nurses[m].get("attr") or "輪班DEN"
         fixed_si = FIXED_SHIFT_MAP.get(attr)
         la_set = leave_adjust_per_m.get(m, set())
+
+        # ── 班次分配偏差懲罰（軟，取代已移除的硬約束）
+        # 每多出目標 +1 個班種，懲罰 DIST_PENALTY；低於目標由人力不足的 off_slack 間接調節
+        DIST_PENALTY = 8
+        _total_d  = sum(b[m][t][0] for t in range(n))
+        _total_e  = sum(b[m][t][1] for t in range(n))
+        _total_nv = sum(b[m][t][2] for t in range(n))
+        _la_count_m = len(leave_adjust_per_m.get(m, set()))
+        _guaranteed_off_m = part_off if nurses[m].get("halftime") else full_off
+        _req_per_day = daily_d + daily_e + daily_n
+        _total_off_m = max(0, M * (n - _la_count_m) - _req_per_day * n)
+        _expected_off_m = (_total_off_m + M - 1) // M
+        _off_days_m = max(_guaranteed_off_m, _expected_off_m)
+        _off_days_m = min(_off_days_m, n - _la_count_m - 1)
+        _work_m = max(0, n - _off_days_m - _la_count_m)
+        _dc, _ec, _nc = shift_counts(attr, _work_m, uid)
+        if _dc > 0:
+            over_d = model.new_int_var(0, n, f"over_d_{m}")
+            model.add(over_d >= _total_d - (_dc + 2))
+            model.add(over_d >= 0)
+            penalties.append(over_d * DIST_PENALTY)
+        if _ec > 0:
+            over_e = model.new_int_var(0, n, f"over_e_{m}")
+            model.add(over_e >= _total_e - (_ec + 2))
+            model.add(over_e >= 0)
+            penalties.append(over_e * DIST_PENALTY)
+        if _nc > 0:
+            over_n = model.new_int_var(0, n, f"over_n_{m}")
+            model.add(over_n >= _total_nv - (_nc + 2))
+            model.add(over_n >= 0)
+            penalties.append(over_n * DIST_PENALTY)
 
         if fixed_si is not None:
             # 固定班：懲罰非固定班種（軟規則，人力不足時才允許偏離）
@@ -997,12 +1070,11 @@ def generate_schedule(
                 consec = 0
     leader_indices = [i for i, n in enumerate(nurses) if n.get("level") == "leader"]
     for t in range(n):
-        for si, req in [(0, daily_d), (1, daily_e), (2, daily_n)]:
+        for si, req, sh in [(0, daily_d, "D"), (1, daily_e, "E"), (2, daily_n, "N")]:
             if req == 0:
                 continue
             if not any(solver.value(b[li][t][si]) for li in leader_indices):
-                anomalies.append(f"⚠ {cycle_dates[t]} {'DEN'[si]}班：無 leader 排班")
-                break
+                anomalies.append(f"⚠ {cycle_dates[t]} {sh}班：無 leader 排班")
 
     # ── 計算格子數（供前端顯示）
     existing_map_keys: set[str] = {
