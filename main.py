@@ -1186,6 +1186,18 @@ def commit_schedule(
         cur_data = rules_res2.data[0].get("data") or {}
         cur_data["last_generated_keys"] = generated_keys
         cur_data["last_generated_at"] = datetime.utcnow().isoformat()
+        # 備份匯入前的預假狀態（供「回復到預假狀態」使用）
+        backup_rows = [
+            {"nurse_uid": r["nurse_uid"], "date": r["date"],
+             "shift": r.get("shift") or "OFF", "confirmed": r.get("confirmed", False)}
+            for r in (existing_res.data or [])
+        ]
+        cur_data["schedule_backup"] = {
+            "rows": backup_rows,
+            "start_date": start_str,
+            "end_date": end_str,
+            "backed_up_at": datetime.utcnow().isoformat(),
+        }
         supabase.table("rules").update({"data": cur_data}).eq("id", rules_res2.data[0]["id"]).execute()
 
     total = len(to_insert) + len(to_update)
@@ -1317,6 +1329,113 @@ def export_schedule(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename, safe='')}"},
     )
+
+
+class ExportTempBody(BaseModel):
+    schedules: dict[str, dict[str, str]]   # {nurse_uid: {date: shift}}
+    cycle_dates: list[str]
+
+
+@app.post("/export/temp")
+def export_temp(
+    body: ExportTempBody,
+    current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
+):
+    """匯出暫時班表（CP-SAT 計算完成但尚未寫入 DB 的結果）"""
+    rules_res = supabase.table("rules").select("*").limit(1).execute()
+    rules = rules_res.data[0].get("data") or {} if rules_res.data else {}
+    cycle = rules.get("cycle", {})
+    start_str = body.cycle_dates[0] if body.cycle_dates else cycle.get("start_date")
+    end_str   = body.cycle_dates[-1] if body.cycle_dates else cycle.get("end_date")
+    if not start_str or not end_str:
+        raise HTTPException(400, "無排班日期")
+
+    shift_defs = rules.get("shifts", {})
+    rest_codes = {s["code"] for s in shift_defs.get("rest", []) if s.get("code")} or {"OFF", "半"}
+
+    users_res = supabase.table("users").select("uid, name, halftime").in_("role", ["nurse", "dual"]).order("sort_order").execute()
+    uid_name   = {u["uid"]: u["name"] for u in (users_res.data or [])}
+    uid_halftime = {u["uid"]: u.get("halftime", False) for u in (users_res.data or [])}
+
+    # 現有 DB 中的班別 → 為「人工填寫」（外框加粗）
+    existing_res = supabase.table("shifts").select("nurse_uid, date, shift, confirmed") \
+        .gte("date", start_str).lte("date", end_str).execute()
+    manual_keys = {f"{r['nurse_uid']}_{r['date']}" for r in (existing_res.data or [])}
+
+    rows = []
+    for uid, date_shifts in body.schedules.items():
+        for d_str in body.cycle_dates:
+            shift = date_shifts.get(d_str, "OFF")
+            if not shift or shift == "OFF":
+                continue
+            # 半職護理師的應休班顯示為「休假」
+            display = "休假" if (uid_halftime.get(uid) and shift in rest_codes) else shift
+            rows.append({"name": uid_name.get(uid, uid), "uid": uid, "date": d_str, "shift": display})
+
+    # 排序：依 sort_order 的 uid 順序，再依日期
+    uid_order = {u["uid"]: i for i, u in enumerate(users_res.data or [])}
+    rows.sort(key=lambda r: (uid_order.get(r["uid"], 999), r["date"]))
+
+    buf = _build_excel("暫時班表", rows, bold_keys=manual_keys, rest_codes=rest_codes - {"OFF"})
+    filename = f"暫時班表_{start_str}_{end_str}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename, safe='')}"},
+    )
+
+
+@app.post("/schedule/revert")
+def revert_schedule(
+    current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
+):
+    """回復到預假狀態：刪除 CP-SAT 生成的班別，恢復匯入前的備份"""
+    operator_uid = current_user.get("sub")
+
+    rules_res = supabase.table("rules").select("id", "data").limit(1).execute()
+    if not rules_res.data:
+        raise HTTPException(400, "找不到規則資料")
+    cur_data = rules_res.data[0].get("data") or {}
+    rules_id = rules_res.data[0]["id"]
+
+    backup = cur_data.get("schedule_backup")
+    if not backup:
+        raise HTTPException(400, "找不到備份資料，請先執行「匯入到班表」才能回復")
+
+    start_str = backup["start_date"]
+    end_str   = backup["end_date"]
+    backup_rows: list[dict] = backup.get("rows", [])
+
+    # 刪除該週期所有現有班別
+    supabase.table("shifts").delete().gte("date", start_str).lte("date", end_str).execute()
+
+    # 還原備份（排除 OFF，只插入有實際班別的資料）
+    restore_rows = [
+        {
+            "code": f"{r['nurse_uid']}_{r['date']}",
+            "label": r["shift"],
+            "nurse_uid": r["nurse_uid"],
+            "date": r["date"],
+            "shift": r["shift"],
+            "confirmed": r.get("confirmed", False),
+            "updated_by": operator_uid,
+        }
+        for r in backup_rows
+        if r.get("shift") and r["shift"] != "OFF"
+    ]
+    if restore_rows:
+        supabase.table("shifts").insert(restore_rows).execute()
+
+    # 清除備份與生成鍵，避免重複回復
+    cur_data.pop("schedule_backup", None)
+    cur_data.pop("last_generated_keys", None)
+    cur_data.pop("last_generated_at", None)
+    supabase.table("rules").update({"data": cur_data}).eq("id", rules_id).execute()
+
+    return {
+        "message": f"✓ 已回復到預假狀態（還原 {len(restore_rows)} 格）",
+        "restored": len(restore_rows),
+    }
 
 
 @app.get("/logs")
