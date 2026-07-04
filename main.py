@@ -8,6 +8,7 @@ import bcrypt as _bcrypt
 from jose import JWTError, jwt
 from datetime import datetime, timedelta, date as date_type
 import math, os, io
+from urllib.parse import quote
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from ortools.sat.python import cp_model
@@ -695,13 +696,12 @@ def generate_schedule(
         total_nv = sum(b[m][t][2] for t in range(n))
         # 應休 OFF（排除 LEAVE_ADJUST）
         free_off = [b[m][t][3] for t in range(n) if t not in leave_adjust_days_m]
-        # 人力不足鬆弛：off_days 下限允許最多減少 MAX_OFF_REDUCE 天（懲罰極高）
-        MAX_OFF_REDUCE = 2
-        off_slack = model.new_int_var(0, MAX_OFF_REDUCE, f"off_slack_{m}")
+        # 人力不足鬆弛：off_days 下限允許最多減少 MAX_OFF_REDUCE 天
+        # 注意：懲罰值在下方 penalties = [] 初始化後才加入，這裡只建立變數
+        off_slack = model.new_int_var(0, 2, f"off_slack_{m}")
         off_slack_vars.append((m, off_slack))
         model.add(sum(free_off) >= off_days - 2 - off_slack)
         model.add(sum(free_off) <= off_days + 2)
-        penalties.append(off_slack * 200)   # 遠高於切換懲罰，只在必要時才縮減
         model.add(total_d  >= max(0, d_cnt  - 2))
         model.add(total_d  <= d_cnt  + 2)
         model.add(total_e  >= max(0, e_cnt  - 2))
@@ -728,8 +728,32 @@ def generate_schedule(
                 model.add(b[m][t+2][0] == 0).only_enforce_if(b[m][t][2])
 
         # ── 硬規則 3：每週至少一天休假（固定啟用）
+        # b[m][t][3]=1 涵蓋：OFF / 半 / LEAVE_ADJUST（V、喪、員⋯皆鎖定為 x==3）
         for ws, we in weeks:
-            model.add(sum(b[m][t][3] for t in range(ws, we+1)) >= 1)
+            week_range = list(range(ws, we + 1))
+            # 計算本週「可自由調整」的天（非確認上班且非第一天鎖定上班）
+            free_in_week = []
+            for t in week_range:
+                if t in leave_adjust_days_m:
+                    free_in_week.append(t)   # LEAVE_ADJUST 已鎖定為 OFF，必然滿足
+                    break                    # 有任何 LEAVE_ADJUST 即可跳出，約束必然成立
+                key = (uid, cycle_dates[t])
+                if key not in existing:
+                    free_in_week.append(t)   # 空白格可排 OFF
+                    continue
+                row = existing[key]
+                sh  = (row.get("shift") or "OFF")
+                # 已鎖定為上班：確認班（不覆蓋模式）或第一天鎖定
+                locked_work = (
+                    (row.get("confirmed") and not overwrite_confirmed and sh not in REST_CODES and sh not in LEAVE_ADJUST)
+                    or (lock_first_day and t == 0 and sh not in REST_CODES and sh not in LEAVE_ADJUST)
+                )
+                if not locked_work:
+                    free_in_week.append(t)
+            if free_in_week:
+                # 有至少一個可自由的天 → 強制至少一天 OFF
+                model.add(sum(b[m][t][3] for t in week_range) >= 1)
+            # 否則整週鎖滿上班 → 跳過約束（異常偵測會在生成後標示警告）
 
         # ── 硬規則 4：每週 D/E/N 至多兩種班別
         for ws, we in weeks:
@@ -828,8 +852,11 @@ def generate_schedule(
                 model.add(sum(b[m][t][si] for m in leaders) + sum(b[m][t][si] for m in seconds) >= 2)
 
     # ── 軟規則：順班目標 + 固定班偏離懲罰
-    FIX_PENALTY = 20  # 固定班偏離懲罰（遠高於換班懲罰 1）
+    FIX_PENALTY = 20
     penalties = []
+    # off_slack 懲罰在此加入（必須在 penalties = [] 之後）
+    for _, slack_var in off_slack_vars:
+        penalties.append(slack_var * 200)  # 遠高於切換懲罰，只在人力不足時才縮減
     for m in range(M):
         attr = nurses[m].get("attr") or "輪班DEN"
         fixed_si = FIXED_SHIFT_MAP.get(attr)
@@ -1116,7 +1143,7 @@ def export_preview(
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename, safe='')}"},
     )
 
 
@@ -1159,7 +1186,7 @@ def export_schedule(
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename, safe='')}"},
     )
 
 
