@@ -967,44 +967,8 @@ def generate_schedule(
                     sched[t] = orig  # 應休類（如半）：保留原班碼
         schedules[nurse["uid"]] = sched
 
-    # ── 寫入資料庫
-    existing_map: dict[str, bool] = {
-        f"{r['nurse_uid']}_{r['date']}": r.get("confirmed", False)
-        for r in (existing_res.data or [])
-    }
-    to_insert, to_update = [], []
-    for nurse_uid, sched in schedules.items():
-        for i, shift in enumerate(sched):
-            d_str = cycle_dates[i]
-            key   = f"{nurse_uid}_{d_str}"
-            if shift == "OFF":
-                continue  # OFF 不寫入，留空
-            if key in existing_map:
-                if not overwrite_confirmed and existing_map[key]:
-                    continue
-                to_update.append({"nurse_uid": nurse_uid, "date": d_str, "shift": shift})
-            else:
-                to_insert.append({
-                    "code":       key,
-                    "label":      shift,
-                    "nurse_uid":  nurse_uid,
-                    "date":       d_str,
-                    "shift":      shift,
-                    "confirmed":  False,
-                    "updated_by": operator_uid,
-                })
-
-    if to_insert:
-        supabase.table("shifts").insert(to_insert).execute()
-    for row in to_update:
-        supabase.table("shifts").update({
-            "shift": row["shift"], "confirmed": False, "updated_by": operator_uid,
-            "updated_at": datetime.utcnow().isoformat(),
-        }).eq("nurse_uid", row["nurse_uid"]).eq("date", row["date"]).execute()
-
     # ── 人力不足警告（off_slack > 0）
     warnings: list[str] = []
-    nurse_name_map = {n["uid"]: n.get("name", n["uid"]) for n in nurses_res.data or []}
     reduced_nurses = []
     for mi, slack_var in off_slack_vars:
         v = solver.value(slack_var)
@@ -1016,12 +980,10 @@ def generate_schedule(
 
     # ── 異常偵測
     anomalies: list[str] = []
-    nurse_uid_list = [n["uid"] for n in nurses]
     SHIFT_NAMES_DETECT = ["D", "E", "N", "OFF"]
     for mi, nurse in enumerate(nurses):
         sched_m = [SHIFT_NAMES_DETECT[solver.value(x[mi][t])] for t in range(n)]
         nm = nurse.get("name") or nurse["uid"]
-        # 跨週連班異常（結合上週末尾）
         prev_m = prev_shifts_by_nurse.get(nurse["uid"], ["OFF"] * 7)
         combined = prev_m + sched_m
         consec = 0
@@ -1033,21 +995,120 @@ def generate_schedule(
                     break
             else:
                 consec = 0
-    # leader 不足（每日每班檢查）
     leader_indices = [i for i, n in enumerate(nurses) if n.get("level") == "leader"]
     for t in range(n):
         for si, req in [(0, daily_d), (1, daily_e), (2, daily_n)]:
             if req == 0:
                 continue
             if not any(solver.value(b[li][t][si]) for li in leader_indices):
-                d_str = cycle_dates[t]
-                shift_name = ["D","E","N"][si]
-                anomalies.append(f"⚠ {d_str} {shift_name}班：無 leader 排班")
-                break  # 每天只報一次
+                anomalies.append(f"⚠ {cycle_dates[t]} {'DEN'[si]}班：無 leader 排班")
+                break
 
-    # ── 儲存本次系統生成的格子鍵（供 Excel 匯出區分人工／系統）
-    generated_keys = [f"{row['nurse_uid']}_{row['date']}" for row in to_insert]
-    # 更新 rules 表
+    # ── 計算格子數（供前端顯示）
+    existing_map_keys: set[str] = {
+        f"{r['nurse_uid']}_{r['date']}" for r in (existing_res.data or [])
+    }
+    existing_confirmed: set[str] = {
+        f"{r['nurse_uid']}_{r['date']}"
+        for r in (existing_res.data or []) if r.get("confirmed")
+    }
+    new_cells, update_cells = 0, 0
+    for nurse_uid, sched in schedules.items():
+        for i, shift in enumerate(sched):
+            if shift == "OFF":
+                continue
+            key = f"{nurse_uid}_{cycle_dates[i]}"
+            if key in existing_map_keys:
+                if overwrite_confirmed or key not in existing_confirmed:
+                    update_cells += 1
+            else:
+                new_cells += 1
+
+    # ── schedules 轉為 {nurse_uid: {date: shift}} 方便前端傳回 commit
+    schedules_dict = {
+        uid: {cycle_dates[i]: s for i, s in enumerate(sched) if s != "OFF"}
+        for uid, sched in schedules.items()
+    }
+
+    return {
+        "message": f"✓ CP-SAT 計算完成（{len(nurses)} 位護理師，新增 {new_cells} 格、更新 {update_cells} 格）",
+        "schedules": schedules_dict,
+        "cycle_dates": cycle_dates,
+        "overwrite_confirmed": overwrite_confirmed,
+        "solver_status": solver.status_name(status),
+        "nurses": len(nurses), "new_cells": new_cells, "update_cells": update_cells,
+        "warnings": warnings,
+        "anomalies": anomalies,
+    }
+
+
+class CommitScheduleBody(BaseModel):
+    schedules: dict[str, dict[str, str]]   # {nurse_uid: {date: shift}}
+    cycle_dates: list[str]
+    overwrite_confirmed: bool = False
+
+
+@app.post("/schedule/commit")
+def commit_schedule(
+    body: CommitScheduleBody,
+    current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
+):
+    """將 generate 回傳的 schedules 寫入資料庫"""
+    operator_uid = current_user.get("sub")
+
+    # 讀取規則以取得班別定義（用於分類）
+    rules_res = supabase.table("rules").select("*").limit(1).execute()
+    rules = rules_res.data[0].get("data") or {} if rules_res.data else {}
+    shift_defs = rules.get("shifts", {})
+    _rest_defs  = shift_defs.get("rest", [])
+    _leave_defs = shift_defs.get("off",  [])
+    REST_CODES   = {s["code"] for s in _rest_defs  if s.get("code")} or {"OFF", "半"}
+    LEAVE_ADJUST = {s["code"] for s in _leave_defs if s.get("code")} or {"V", "員", "喪", "延休", "補休", "調移"}
+
+    all_dates = body.cycle_dates
+    if not all_dates:
+        raise HTTPException(400, "無排班日期")
+
+    # 讀取現有班別
+    start_str, end_str = all_dates[0], all_dates[-1]
+    existing_res = supabase.table("shifts").select("nurse_uid, date, shift, confirmed") \
+        .gte("date", start_str).lte("date", end_str).execute()
+    existing_map: dict[str, bool] = {
+        f"{r['nurse_uid']}_{r['date']}": r.get("confirmed", False)
+        for r in (existing_res.data or [])
+    }
+
+    to_insert, to_update = [], []
+    generated_keys = []
+
+    for nurse_uid, date_shifts in body.schedules.items():
+        for d_str, shift in date_shifts.items():
+            if shift == "OFF":
+                continue
+            key = f"{nurse_uid}_{d_str}"
+            if key in existing_map:
+                if not body.overwrite_confirmed and existing_map[key]:
+                    continue  # 已確認且不覆蓋 → 跳過
+                to_update.append({"nurse_uid": nurse_uid, "date": d_str, "shift": shift})
+            else:
+                to_insert.append({
+                    "code": key, "label": shift,
+                    "nurse_uid": nurse_uid, "date": d_str,
+                    "shift": shift, "confirmed": False,
+                    "updated_by": operator_uid,
+                })
+                generated_keys.append(key)
+
+    if to_insert:
+        supabase.table("shifts").insert(to_insert).execute()
+    for row in to_update:
+        supabase.table("shifts").update({
+            "shift": row["shift"], "confirmed": False,
+            "updated_by": operator_uid,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("nurse_uid", row["nurse_uid"]).eq("date", row["date"]).execute()
+
+    # 儲存生成鍵（供 Excel 匯出區分人工／系統）
     rules_res2 = supabase.table("rules").select("id", "data").limit(1).execute()
     if rules_res2.data:
         cur_data = rules_res2.data[0].get("data") or {}
@@ -1057,12 +1118,8 @@ def generate_schedule(
 
     total = len(to_insert) + len(to_update)
     return {
-        "message": f"✓ 已生成 {len(nurses)} 位護理師的班表（共 {total} 格）",
-        "solver_status": solver.status_name(status),
-        "nurses": len(nurses), "cells": total,
+        "message": f"✓ 已匯入 {total} 格（新增 {len(to_insert)}、更新 {len(to_update)}）",
         "inserted": len(to_insert), "updated": len(to_update),
-        "warnings": warnings,
-        "anomalies": anomalies,
     }
 
 
