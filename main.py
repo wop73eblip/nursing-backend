@@ -728,23 +728,22 @@ def generate_schedule(
                 # N 後第 2 天也不能是 D（1 天 OFF 不夠，要 2 天）
                 model.add(b[m][t+2][0] == 0).only_enforce_if(b[m][t][2])
 
-        # ── 硬規則 3：每週至少一天休假（固定啟用）
-        # b[m][t][3]=1 涵蓋：OFF / 半 / LEAVE_ADJUST（V、喪、員⋯皆鎖定為 x==3）
+        # ── 硬規則 3：每週至少一天應休（OFF 或半），LEAVE_ADJUST（V、員、喪⋯）不計入
         for ws, we in weeks:
             week_range = list(range(ws, we + 1))
+            # 僅計算非 LEAVE_ADJUST 的天（LEAVE_ADJUST 不算應休）
+            rest_eligible = [t for t in week_range if t not in leave_adjust_days_m]
+            if not rest_eligible:
+                continue  # 整週都是 LEAVE_ADJUST，跳過
             # 計算本週「可自由調整」的天（非確認上班且非第一天鎖定上班）
             free_in_week = []
-            for t in week_range:
-                if t in leave_adjust_days_m:
-                    free_in_week.append(t)   # LEAVE_ADJUST 已鎖定為 OFF，必然滿足
-                    break                    # 有任何 LEAVE_ADJUST 即可跳出，約束必然成立
+            for t in rest_eligible:
                 key = (uid, cycle_dates[t])
                 if key not in existing:
-                    free_in_week.append(t)   # 空白格可排 OFF
+                    free_in_week.append(t)
                     continue
                 row = existing[key]
                 sh  = (row.get("shift") or "OFF")
-                # 已鎖定為上班：確認班（不覆蓋模式）或第一天鎖定
                 locked_work = (
                     (row.get("confirmed") and not overwrite_confirmed and sh not in REST_CODES and sh not in LEAVE_ADJUST)
                     or (lock_first_day and t == 0 and sh not in REST_CODES and sh not in LEAVE_ADJUST)
@@ -752,8 +751,8 @@ def generate_schedule(
                 if not locked_work:
                     free_in_week.append(t)
             if free_in_week:
-                # 有至少一個可自由的天 → 強制至少一天 OFF
-                model.add(sum(b[m][t][3] for t in week_range) >= 1)
+                # 有至少一個可自由的天 → 強制至少一天 OFF/半（排除 LEAVE_ADJUST）
+                model.add(sum(b[m][t][3] for t in rest_eligible) >= 1)
             # 否則整週鎖滿上班 → 跳過約束（異常偵測會在生成後標示警告）
 
         # ── 硬規則 4：每週 D/E/N 至多兩種班別
