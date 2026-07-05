@@ -903,8 +903,9 @@ def generate_schedule(
         fixed_si = FIXED_SHIFT_MAP.get(attr)
         la_set = leave_adjust_per_m.get(m, set())
 
-        # ── 班次分配偏差懲罰（軟，取代已移除的硬約束）
-        # 每多出目標 +1 個班種，懲罰 DIST_PENALTY；低於目標由人力不足的 off_slack 間接調節
+        # ── 班次分配偏差懲罰（雙向，只約束獨立班種）
+        # D+E / D+N / E+N 是固定值，只需約束其中一個方向，另一個自動對齊
+        # DEN 約束 D 和 E，N 自動跟著
         DIST_PENALTY = 8
         _total_d  = sum(b[m][t][0] for t in range(n))
         _total_e  = sum(b[m][t][1] for t in range(n))
@@ -918,21 +919,33 @@ def generate_schedule(
         _off_days_m = min(_off_days_m, n - _la_count_m - 1)
         _work_m = max(0, n - _off_days_m - _la_count_m)
         _dc, _ec, _nc = shift_counts(attr, _work_m, uid)
-        if _dc > 0:
-            over_d = model.new_int_var(0, n, f"over_d_{m}")
-            model.add(over_d >= _total_d - (_dc + 2))
-            model.add(over_d >= 0)
-            penalties.append(over_d * DIST_PENALTY)
-        if _ec > 0:
-            over_e = model.new_int_var(0, n, f"over_e_{m}")
-            model.add(over_e >= _total_e - (_ec + 2))
-            model.add(over_e >= 0)
-            penalties.append(over_e * DIST_PENALTY)
-        if _nc > 0:
-            over_n = model.new_int_var(0, n, f"over_n_{m}")
-            model.add(over_n >= _total_nv - (_nc + 2))
-            model.add(over_n >= 0)
-            penalties.append(over_n * DIST_PENALTY)
+
+        def _add_abs_penalty(total_var, target: int, label: str):
+            """懲罰雙向偏差：|actual - target| > 1 才開始計分"""
+            if target <= 0:
+                return
+            dev = model.new_int_var(0, n, label)
+            model.add(dev >= total_var - target)   # actual 超過 target
+            model.add(dev >= target - total_var)   # actual 低於 target
+            model.add(dev >= 0)
+            penalties.append(dev * DIST_PENALTY)
+
+        if attr == "輪班DE":
+            _add_abs_penalty(_total_d, _dc, f"dev_d_{m}")
+            # E 自動對齊，不重複懲罰
+        elif attr == "輪班DN":
+            _add_abs_penalty(_total_d, _dc, f"dev_d_{m}")
+            # N 自動對齊
+        elif attr == "輪班EN":
+            _add_abs_penalty(_total_e, _ec, f"dev_e_{m}")
+            # N 自動對齊
+        elif attr == "輪班DEN":
+            _add_abs_penalty(_total_d, _dc, f"dev_d_{m}")
+            _add_abs_penalty(_total_e, _ec, f"dev_e_{m}")
+            # N 自動對齊
+        else:
+            # 固定班由 FIX_PENALTY 處理，此處不另外懲罰
+            pass
 
         if fixed_si is not None:
             # 固定班：懲罰非固定班種（軟規則，人力不足時才允許偏離）
