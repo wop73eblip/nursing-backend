@@ -921,12 +921,12 @@ def generate_schedule(
         _dc, _ec, _nc = shift_counts(attr, _work_m, uid)
 
         def _add_abs_penalty(total_var, target: int, label: str):
-            """懲罰雙向偏差：|actual - target| > 1 才開始計分"""
+            """懲罰雙向偏差：±1 天彈性，超過才開始計分"""
             if target <= 0:
                 return
             dev = model.new_int_var(0, n, label)
-            model.add(dev >= total_var - target)   # actual 超過 target
-            model.add(dev >= target - total_var)   # actual 低於 target
+            model.add(dev >= total_var - target - 1)   # actual > target+1 才罰
+            model.add(dev >= target - total_var - 1)   # actual < target-1 才罰
             model.add(dev >= 0)
             penalties.append(dev * DIST_PENALTY)
 
