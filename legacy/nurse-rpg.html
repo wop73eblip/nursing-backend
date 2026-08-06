@@ -1,0 +1,357 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>白衣天使的第一天 · 護理 RPG</title>
+<style>
+  :root{
+    --bg:#0c1322;--ink:#eaf1fb;--muted:#9fb0cc;--line:#2a3c5c;
+    --panel:#13203a;--accent:#5ed0ff;--good:#4ade80;--bad:#f87171;--warn:#fbbf24;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Segoe UI","Microsoft JhengHei",system-ui,sans-serif;
+    min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:14px}
+  h1{font-size:19px;margin:0}
+  .hud{width:100%;max-width:660px;display:flex;gap:8px;flex-wrap:wrap;
+    align-items:center;justify-content:space-between;margin:8px 0}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    padding:5px 10px;font-size:13px}
+  .chip b{color:var(--accent)}
+  .metre{width:78px;height:7px;background:#22314e;border-radius:99px;
+    overflow:hidden;display:inline-block;vertical-align:middle;margin-left:4px}
+  .metre>i{display:block;height:100%}
+  .stage{position:relative;width:100%;max-width:660px}
+  canvas{width:100%;height:auto;border:2px solid var(--line);border-radius:14px;
+    image-rendering:pixelated;background:#0f1a30;display:block}
+  .quest{width:100%;max-width:660px;margin-top:8px;font-size:13px;color:var(--muted)}
+  .quest b{color:var(--warn)}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px;text-align:center}
+
+  .overlay{position:absolute;inset:0;display:none;align-items:flex-end;justify-content:center}
+  .box{width:96%;margin:0 0 12px;background:rgba(10,18,34,.97);border:2px solid var(--accent);
+    border-radius:14px;padding:14px 16px;box-shadow:0 8px 30px #000a}
+  .who{color:var(--accent);font-weight:800;font-size:14px;margin-bottom:5px}
+  .say{font-size:14px;line-height:1.7;min-height:22px}
+  .choices{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+  .opt{text-align:left;background:#182a49;border:1px solid var(--line);color:var(--ink);
+    padding:10px 12px;border-radius:10px;cursor:pointer;font-size:14px;transition:.12s}
+  .opt:hover{border-color:var(--accent);transform:translateX(2px)}
+  .cont{margin-top:12px;text-align:right}
+  .btn{background:var(--accent);color:#03263a;border:none;border-radius:10px;
+    padding:9px 18px;font-weight:800;cursor:pointer;font-size:14px}
+  .fb{margin-top:10px;padding:10px;border-radius:10px;font-size:13px;line-height:1.7}
+  .fb.ok{background:rgba(74,222,128,.12);border:1px solid var(--good)}
+  .fb.no{background:rgba(248,113,113,.12);border:1px solid var(--bad)}
+  .center{text-align:center}
+  .dpad{display:none;gap:6px;margin-top:12px;justify-content:center}
+  .dpad button{width:52px;height:52px;font-size:20px;border-radius:12px;
+    background:var(--panel);border:1px solid var(--line);color:var(--ink);cursor:pointer}
+  .grid3{display:grid;grid-template-columns:repeat(3,52px);gap:6px;justify-items:center}
+  @media(hover:none){.dpad{display:block}}
+  .lead{color:var(--muted);line-height:1.9;font-size:14px;text-align:left}
+  .fanfare{color:var(--warn);font-weight:800}
+</style>
+
+<h1>⚕️ 白衣天使的第一天</h1>
+<div class="hud">
+  <div class="chips">
+    <span class="chip">Lv <b id="lv">1</b></span>
+    <span class="chip">EXP<span class="metre"><i id="xp" style="width:0;background:var(--accent)"></i></span></span>
+    <span class="chip">體力<span class="metre"><i id="hp" style="width:100%;background:var(--good)"></i></span></span>
+    <span class="chip">病人信任<span class="metre"><i id="tr" style="width:100%;background:var(--warn)"></i></span></span>
+  </div>
+</div>
+
+<div class="stage">
+  <canvas id="cv" width="660" height="484"></canvas>
+  <div class="overlay" id="ov">
+    <div class="box">
+      <div class="who" id="who"></div>
+      <div class="say" id="say"></div>
+      <div class="choices" id="choices"></div>
+      <div class="fb" id="fb" style="display:none"></div>
+      <div class="cont" id="cont" style="display:none"><button class="btn" id="contbtn">繼續 ▶</button></div>
+    </div>
+  </div>
+</div>
+
+<div class="quest" id="quest">📋 任務：向<b>學姐</b>報到，完成 4 位病人的照護。</div>
+<div class="hint">🎮 方向鍵 / WASD 移動，走到人物旁按 <b>空白鍵 / Enter</b> 互動</div>
+
+<div class="dpad">
+  <div class="grid3">
+    <span></span><button data-d="up">▲</button><span></span>
+    <button data-d="left">◀</button><button data-d="act">●</button><button data-d="right">▶</button>
+    <span></span><button data-d="down">▼</button><span></span>
+  </div>
+</div>
+
+<script>
+const TILE=44, COLS=15, ROWS=11;
+const MAP=[
+ "###############",
+ "#.C.C.C.C.....#",
+ "#.............#",
+ "#.............#",
+ "#.............#",
+ "#....#####....#",
+ "#.............#",
+ "#.............#",
+ "#......M......#",
+ "#......@......#",
+ "###############",
+];
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+
+// ---- 狀態 ----
+let player={x:7,y:9,dir:{x:0,y:-1}};
+let lv=1, xp=0, hp=100, trust=100;
+const XP_PER=25;
+
+// ---- NPC / 病人 ----
+const patients=[
+ { x:2,y:1, emoji:"👴", name:"王伯伯 · 高血壓",
+   enc:{
+    intro:"護理師啊，我要吃血壓的藥了嗎？（你看了手圈：<b>李美惠 A067</b>，但藥袋寫著<b>王大明 A012</b>）",
+    q:"三讀五對時，你發現手圈和藥袋名字對不上，怎麼做？",
+    opts:[
+     {t:"直接把藥給病人，反正床號沒錯",ok:false,fb:"❌ 太危險了！床號可能換床，<b>病人辨識要靠姓名＋病歷號雙重核對</b>，絕不能只看床號。"},
+     {t:"停下來，重新核對病人身分與藥袋，通報確認",ok:true,fb:"✅ 正確！這是<b>給藥錯誤最常見的源頭</b>。發現對不上就該停止、退藥、重新確認，寧可慢也不能錯。"},
+     {t:"問病人『你是王大明嗎？』他點頭就給",ok:false,fb:"❌ 不可用引導式問法。應請病人<b>主動說出</b>姓名與生日，再與手圈、藥袋三方核對。"},
+    ]}},
+ { x:4,y:1, emoji:"👵", name:"陳奶奶 · 頭痛",
+   enc:{
+    intro:"護理師，我後腦杓好痛、看東西霧霧的…（你量了血壓：<b>196 / 112 mmHg</b>）",
+    q:"血壓 196/112 併頭痛、視力模糊，你的第一步？",
+    opts:[
+     {t:"給她一顆止痛藥讓她睡一下",ok:false,fb:"❌ 這可能是<b>高血壓危象</b>，止痛藥治標且會延誤處置。"},
+     {t:"立即通報醫師，持續監測生命徵象並記錄",ok:true,fb:"✅ 正確！收縮壓 >180 併神經症狀屬<b>高血壓急症</b>，須<b>盡快通報醫師</b>、備妥處置、密切監測。"},
+     {t:"叫她放輕鬆、多喝水就會好",ok:false,fb:"❌ 低估了危險徵兆。異常生命徵象＋症狀，一定要往上通報。"},
+    ]}},
+ { x:6,y:1, emoji:"🧒", name:"小明 · 要打針",
+   enc:{
+    intro:"（小朋友一看到你就大哭）我不要打針！走開啦！",
+    q:"面對害怕打針、哭鬧的孩子，最好的做法？",
+    opts:[
+     {t:"蹲下與他平視，同理感受，用他懂的話說明",ok:true,fb:"✅ 很棒！<b>蹲低平視＋同理＋簡單說明</b>能建立信任、降低恐懼，也讓打針更順利安全。"},
+     {t:"叫家長壓住他，快點打完比較不痛苦",ok:false,fb:"❌ 強制壓制會造成心理創傷、也增加針扎風險。安撫與準備才是關鍵。"},
+     {t:"嚇他：『不打針病就好不了喔』",ok:false,fb:"❌ 恐嚇會破壞信任，兒童照護講究<b>安全感與衛教技巧</b>。"},
+    ]}},
+ { x:8,y:1, emoji:"🧑", name:"林先生 · 按呼叫鈴",
+   enc:{
+    intro:"護理師…我剛想下床上廁所，突然頭很暈、冒冷汗、心跳好快…",
+    q:"病人主訴頭暈冒冷汗，你第一時間怎麼處理？",
+    opts:[
+     {t:"請他先別動、就地評估意識與生命徵象、必要時測血糖",ok:true,fb:"✅ 正確！頭暈冒冷汗要防<b>跌倒與姿勢性低血壓/低血糖</b>，先<b>確保安全、就地評估</b>再處置。"},
+     {t:"馬上扶他站起來走去廁所比較快",ok:false,fb:"❌ 很可能當場暈倒受傷。有暈眩徵象時，<b>安全第一，先別移動</b>。"},
+     {t:"叫他自己撐一下，等等就不暈了",ok:false,fb:"❌ 忽視主訴。病人的不適訊號都要即時評估。"},
+    ]}},
+];
+const npcByPos={};
+patients.forEach(p=>{p.done=false; npcByPos[p.x+","+p.y]=p;});
+const mentor={x:7,y:8,emoji:"👩‍⚕️",name:"淑芬學姐"};
+npcByPos[mentor.x+","+mentor.y]=mentor;
+
+// ---- 繪圖 ----
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  for(let y=0;y<ROWS;y++)for(let x=0;x<COLS;x++){
+    const t=MAP[y][x];
+    const px=x*TILE, py=y*TILE;
+    if(t==='#'){ ctx.fillStyle='#1c2e4d'; ctx.fillRect(px,py,TILE,TILE);
+      ctx.fillStyle='#24406b'; ctx.fillRect(px+3,py+3,TILE-6,TILE-6); }
+    else { ctx.fillStyle=(x+y)%2? '#101d36':'#12213c'; ctx.fillRect(px,py,TILE,TILE); }
+  }
+  // 護理站標示
+  ctx.font='22px serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('🖥️', 7*TILE+TILE/2, 5*TILE+TILE/2);
+  // 病床（畫在病人腳下）
+  patients.forEach(p=>{
+    ctx.font='26px serif';
+    ctx.fillText('🛏️', p.x*TILE+TILE/2, p.y*TILE+TILE/2+2);
+  });
+  // NPC
+  Object.values(npcByPos).forEach(n=>{
+    ctx.font='26px serif';
+    ctx.fillText(n.emoji, n.x*TILE+TILE/2, n.y*TILE+TILE/2-4);
+    if(n.done){ ctx.font='16px serif'; ctx.fillText('✅', n.x*TILE+TILE-10, n.y*TILE+10); }
+    else if(n.enc){ ctx.font='16px serif'; ctx.fillText('❗', n.x*TILE+TILE-10, n.y*TILE+10); }
+  });
+  // 玩家
+  ctx.font='26px serif';
+  ctx.fillText('🧑‍⚕️', player.x*TILE+TILE/2, player.y*TILE+TILE/2);
+  // 面向小箭頭
+  ctx.fillStyle=(player.dir.x||player.dir.y)?'#5ed0ff':'transparent';
+  ctx.beginPath();
+  const cx=player.x*TILE+TILE/2+player.dir.x*16, cy=player.y*TILE+TILE/2+player.dir.y*16;
+  ctx.arc(cx,cy,3.5,0,7); ctx.fill();
+}
+
+function blocked(x,y){
+  if(x<0||y<0||x>=COLS||y>=ROWS) return true;
+  if(MAP[y][x]==='#') return true;
+  if(npcByPos[x+","+y]) return true;
+  return false;
+}
+
+let busy=false; // 對話中
+function move(dx,dy){
+  if(busy) return;
+  player.dir={x:dx,y:dy};
+  const nx=player.x+dx, ny=player.y+dy;
+  if(!blocked(nx,ny)){ player.x=nx; player.y=ny; }
+  draw();
+}
+function interact(){
+  if(busy) return;
+  const tx=player.x+player.dir.x, ty=player.y+player.dir.y;
+  const n=npcByPos[tx+","+ty];
+  if(!n) return;
+  if(n===mentor) talkMentor();
+  else openEnc(n);
+}
+
+// ---- 對話系統 ----
+const ov=document.getElementById('ov'), who=document.getElementById('who'),
+  say=document.getElementById('say'), choicesEl=document.getElementById('choices'),
+  fbEl=document.getElementById('fb'), contWrap=document.getElementById('cont'),
+  contBtn=document.getElementById('contbtn');
+let onCont=null;
+
+function dialog(name, text, choices, contFn){
+  busy=true; ov.style.display='flex';
+  who.innerHTML=name; say.innerHTML=text;
+  fbEl.style.display='none'; choicesEl.innerHTML=''; contWrap.style.display='none'; onCont=null;
+  if(choices){
+    choices.forEach((c,i)=>{
+      const b=document.createElement('button'); b.className='opt'; b.innerHTML=c.t;
+      b.onclick=()=>c.onPick(i); choicesEl.appendChild(b);
+    });
+  }
+  if(contFn){ contWrap.style.display='block'; onCont=contFn; }
+}
+function closeDialog(){ busy=false; ov.style.display='none'; draw(); }
+contBtn.onclick=()=>{ if(onCont){const f=onCont; onCont=null; f();} };
+
+function openEnc(n){
+  if(n.done){ dialog(n.name,"謝謝你，護理師，我好多了 😊",null,closeDialog); return; }
+  const e=n.enc;
+  // 先講病情，再出選擇
+  dialog(n.name, e.intro, null, ()=>askEnc(n));
+}
+function askEnc(n){
+  const e=n.enc;
+  const choices=e.opts.map(o=>({t:o.t, onPick:()=>resolve(n,o)}));
+  dialog(n.name, "🩺 "+e.q, choices, null);
+}
+function resolve(n,o){
+  choicesEl.innerHTML='';
+  fbEl.style.display='block';
+  fbEl.className='fb '+(o.ok?'ok':'no');
+  fbEl.innerHTML=o.fb;
+  if(o.ok){
+    n.done=true; addXp(XP_PER); trust=Math.min(100,trust+5);
+    dialog(n.name,"🩺 "+n.enc.q,null,null);
+    say.innerHTML="🩺 "+n.enc.q;
+  }else{
+    hp=Math.max(0,hp-15); trust=Math.max(0,trust-15);
+  }
+  // 保留 feedback 與繼續鍵
+  fbEl.style.display='block'; fbEl.className='fb '+(o.ok?'ok':'no'); fbEl.innerHTML=o.fb;
+  contWrap.style.display='block';
+  onCont = o.ok ? afterWin(n) : ()=>askEnc(n); // 答錯可再試
+  updateHud();
+  if(hp<=0){ onCont=exhausted; }
+}
+function afterWin(n){
+  return ()=>{
+    if(patients.every(p=>p.done)){
+      dialog(n.name, "太好了，全部照護完成！快去找<b>學姐交班</b>吧 👏", null, closeDialog);
+      document.getElementById('quest').innerHTML="📋 任務：所有病人已照護完成！回去找 <b>淑芬學姐</b> 交班。";
+    } else {
+      dialog(n.name, "謝謝你，我覺得安心多了 😊", null, closeDialog);
+    }
+  };
+}
+function exhausted(){
+  dialog("旁白","💤 你太累了，靠著護理站休息了一下…（體力回復）",null,()=>{hp=60;updateHud();closeDialog();});
+}
+
+function talkMentor(){
+  const doneCount=patients.filter(p=>p.done).length;
+  if(patients.every(p=>p.done)){
+    endGame();
+  } else if(doneCount===0){
+    dialog(mentor.name,
+     "歡迎來到病房，新人！今天你負責這 4 位病人。記住——<b>三讀五對</b>、<b>生命徵象</b>、還有病人的每一句主訴，都不能馬虎。走，去照顧他們吧！有 ❗ 的就是需要你的病人。",
+     null, closeDialog);
+  } else {
+    dialog(mentor.name, `做得不錯！已經完成 <b>${doneCount}/4</b> 位。剩下的病人還在等你，加油！`, null, closeDialog);
+  }
+}
+
+// ---- 數值 ----
+function addXp(n){
+  xp+=n;
+  while(xp>=100){ xp-=100; lv++; }
+  updateHud();
+}
+function updateHud(){
+  document.getElementById('lv').textContent=lv;
+  document.getElementById('xp').style.width=xp+'%';
+  const hpEl=document.getElementById('hp'); hpEl.style.width=hp+'%';
+  hpEl.style.background=hp>50?'var(--good)':hp>25?'var(--warn)':'var(--bad)';
+  document.getElementById('tr').style.width=trust+'%';
+}
+
+// ---- 結局：交班 ----
+function endGame(){
+  addXp(0);
+  let grade, word;
+  if(trust>=85&&hp>=60){grade='S';word='完美的一天！你已經是病人最信賴的護理師。';}
+  else if(trust>=60){grade='A';word='安全下班，表現亮眼，繼續保持！';}
+  else if(trust>=40){grade='B';word='順利完成，有些細節可以再穩一點。';}
+  else {grade='C';word='今天有點驚險，回去複習三讀五對與生命徵象判讀吧。';}
+  const report=
+   `<div class="center"><div class="who" style="font-size:16px">📝 交班報告 · 第一天結束</div>
+    <div class="fanfare" style="font-size:44px;margin:6px">評級 ${grade}</div>
+    <div style="color:var(--muted);margin-bottom:10px">${word}</div></div>
+    <div class="lead">
+      🎖️ 護理師等級：<b>Lv.${lv}</b>（EXP ${xp}%）<br>
+      💛 病人信任度：${trust}／100　｜　體力：${hp}／100<br><br>
+      <b>今日學到：</b><br>
+      ① 給藥前姓名＋病歷號雙重核對（三讀五對）<br>
+      ② 異常生命徵象要即時通報醫師<br>
+      ③ 兒童照護：蹲低、同理、衛教<br>
+      ④ 頭暈主訴：安全第一，就地評估<br><br>
+      這只是原型的第一天——真正的護理師，是把每一次核對都當第一次一樣認真 💙
+    </div>
+    <div class="cont" style="text-align:center;margin-top:14px">
+      <button class="btn" onclick="location.reload()">再上一班 🔁</button></div>`;
+  busy=true; ov.style.display='flex';
+  ov.querySelector('.box').innerHTML=report;
+}
+
+// ---- 輸入 ----
+window.addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if(busy){
+    if((k==='enter'||k===' ')&&onCont){ e.preventDefault(); const f=onCont;onCont=null;f(); }
+    return;
+  }
+  if(k==='arrowup'||k==='w'){e.preventDefault();move(0,-1);}
+  else if(k==='arrowdown'||k==='s'){e.preventDefault();move(0,1);}
+  else if(k==='arrowleft'||k==='a'){e.preventDefault();move(-1,0);}
+  else if(k==='arrowright'||k==='d'){e.preventDefault();move(1,0);}
+  else if(k===' '||k==='enter'||k==='e'){e.preventDefault();interact();}
+});
+// 觸控 D-pad
+document.querySelectorAll('.dpad button').forEach(b=>{
+  b.onclick=()=>{const d=b.dataset.d;
+    if(d==='up')move(0,-1);else if(d==='down')move(0,1);
+    else if(d==='left')move(-1,0);else if(d==='right')move(1,0);
+    else if(d==='act'){ if(busy&&onCont){const f=onCont;onCont=null;f();} else interact(); }};
+});
+
+updateHud(); draw();
+</script>

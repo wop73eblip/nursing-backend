@@ -1,0 +1,302 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>溫馨病房 · 佈置 Demo</title>
+<style>
+  :root{
+    --bg:#efe7db;--ink:#4a3f34;--muted:#8a7c6b;--accent:#e8a34d;--accent2:#c9822b;
+    --wall:#c9b79c;--wall2:#b8a488;--good:#8bc48a;--pink:#e79bb0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:
+    radial-gradient(900px 500px at 50% -10%,#fff6e8,transparent),var(--bg);
+    color:var(--ink);font-family:"Segoe UI","Microsoft JhengHei",system-ui,sans-serif;
+    min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:14px}
+  h1{font-size:19px;margin:2px 0}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:8px}
+  .hud{width:100%;max-width:600px;display:flex;gap:8px;flex-wrap:wrap;
+    justify-content:center;margin-bottom:8px}
+  .chip{background:#fff;border:2px solid var(--wall);border-radius:12px;
+    padding:5px 12px;font-size:13px;box-shadow:0 2px 0 var(--wall2)}
+  .chip b{color:var(--accent2)}
+  .metre{width:80px;height:8px;background:#e3d6c2;border-radius:99px;
+    display:inline-block;vertical-align:middle;margin-left:5px;overflow:hidden}
+  .metre>i{display:block;height:100%;background:linear-gradient(90deg,var(--good),#5fae5f);transition:.3s}
+  .stage{position:relative;width:100%;max-width:600px}
+  canvas{width:100%;height:auto;border:4px solid var(--wall);border-radius:18px;
+    background:#f6ecda;display:block;box-shadow:0 6px 0 var(--wall2),0 12px 24px #0002}
+  .tray{width:100%;max-width:600px;margin-top:10px;background:#fff;border:2px solid var(--wall);
+    border-radius:14px;padding:10px;display:none}
+  .tray.on{display:block}
+  .tray .row{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+  .fbtn{background:#fbf3e5;border:2px solid var(--wall);border-radius:10px;
+    width:52px;height:52px;font-size:24px;cursor:pointer;transition:.12s;position:relative}
+  .fbtn:hover{border-color:var(--accent)}
+  .fbtn.sel{border-color:var(--accent2);background:#ffe9c9;transform:translateY(-2px)}
+  .tray .tip{font-size:12px;color:var(--muted);text-align:center;margin-top:8px}
+  .controls{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+  .btn{border:2px solid var(--accent2);background:var(--accent);color:#fff;font-weight:800;
+    border-radius:12px;padding:9px 16px;cursor:pointer;font-size:14px;box-shadow:0 3px 0 var(--accent2)}
+  .btn:active{transform:translateY(2px);box-shadow:0 1px 0 var(--accent2)}
+  .btn.ghost{background:#fff;color:var(--accent2)}
+  .hint{font-size:12px;color:var(--muted);margin-top:8px;text-align:center;line-height:1.7}
+
+  .overlay{position:absolute;inset:0;display:none;align-items:flex-end;justify-content:center}
+  .box{width:94%;margin-bottom:12px;background:#fffdf7;border:3px solid var(--accent);
+    border-radius:16px;padding:14px 16px;box-shadow:0 8px 24px #0003}
+  .who{color:var(--accent2);font-weight:800;font-size:15px;margin-bottom:5px}
+  .say{font-size:14px;line-height:1.7}
+  .cont{text-align:right;margin-top:10px}
+  .dpad{display:none;margin-top:12px}
+  .grid3{display:grid;grid-template-columns:repeat(3,54px);gap:6px;justify-items:center}
+  .grid3 button{width:54px;height:54px;font-size:20px;border-radius:12px;
+    border:2px solid var(--wall);background:#fff;cursor:pointer}
+  @media(hover:none){.dpad{display:block}}
+</style>
+
+<h1>🏡 溫馨病房</h1>
+<div class="sub">房間制佈置 Demo · 走動探索 × 佈置 × 照護</div>
+
+<div class="hud">
+  <span class="chip">📍<b id="roomName">護理站</b></span>
+  <span class="chip">舒適度<span class="metre"><i id="comfort" style="width:40%"></i></span></span>
+  <span class="chip">😊病人心情 <b id="mood">—</b></span>
+</div>
+
+<div class="stage">
+  <canvas id="cv" width="572" height="396"></canvas>
+  <div class="overlay" id="ov">
+    <div class="box">
+      <div class="who" id="who"></div>
+      <div class="say" id="say"></div>
+      <div class="cont"><button class="btn" id="cbtn">好 ▶</button></div>
+    </div>
+  </div>
+</div>
+
+<div class="tray" id="tray">
+  <div class="row" id="ftrow"></div>
+  <div class="tip">選一件家具 →（在畫面上）點空地擺放；點已放的家具可移除</div>
+</div>
+
+<div class="controls">
+  <button class="btn" id="buildBtn">🔨 佈置模式</button>
+  <button class="btn ghost" id="talkBtn">💬 互動</button>
+</div>
+
+<div class="hint">
+  🎮 方向鍵/WASD 移動　·　走到門口自動換房間　·　靠近病人按空白鍵互動<br>
+  把病房舒適度佈置到 <b>80</b> 以上，病人心情會變好喔！
+</div>
+
+<div class="dpad">
+  <div class="grid3">
+    <span></span><button data-d="up">▲</button><span></span>
+    <button data-d="left">◀</button><button data-d="act">💬</button><button data-d="right">▶</button>
+    <span></span><button data-d="down">▼</button><span></span>
+  </div>
+</div>
+
+<script>
+const TILE=44, COLS=13, ROWS=9;
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+
+// ---- 家具清單 ----
+const FURN=[
+  {e:"🪴",n:"盆栽"},{e:"🛋️",n:"沙發"},{e:"🪑",n:"椅子"},{e:"🗄️",n:"櫃子"},
+  {e:"💡",n:"檯燈"},{e:"📺",n:"電視"},{e:"💐",n:"花束"},{e:"🧸",n:"玩偶"},
+];
+let selFurn=0;
+
+// ---- 房間資料（0=護理站, 1=病房101, 2=病房102）----
+const rooms=[
+  { name:"護理站", floorA:"#f3e6cf", floorB:"#eeddc0",
+    doors:{ "0,4":{to:1,ex:[11,4]}, "12,4":{to:2,ex:[1,4]} },
+    fixed:[{x:6,y:2,e:"🖥️"}],
+    npcs:[{x:6,y:3,e:"👩‍⚕️",name:"淑芬學姐",fixed:true}],
+    furn:[] },
+  { name:"病房 101", floorA:"#eaf0e4", floorB:"#e2ebd8",
+    doors:{ "12,4":{to:0,ex:[1,4]} },
+    fixed:[{x:2,y:2,e:"🛏️"}],
+    npcs:[{x:3,y:2,e:"👴",name:"王伯伯"}],
+    furn:[] },
+  { name:"病房 102", floorA:"#efe8f2","floorB":"#e7dced",
+    doors:{ "0,4":{to:0,ex:[11,4]} },
+    fixed:[{x:2,y:2,e:"🛏️"}],
+    npcs:[{x:3,y:2,e:"👵",name:"陳奶奶"}],
+    furn:[] },
+];
+let cur=0;
+let player={x:6,y:4,dir:{x:0,y:-1}};
+let building=false, busy=false, onCont=null;
+
+// ---- 舒適度 ----
+function comfortOf(r){ return Math.min(100, 40 + rooms[r].furn.length*8); }
+function isPatientRoom(r){ return r!==0; }
+
+// ---- 佔用判斷 ----
+function occupant(r,x,y){
+  const room=rooms[r];
+  for(const f of room.fixed) if(f.x===x&&f.y===y) return "fixed";
+  for(const f of room.furn)  if(f.x===x&&f.y===y) return "furn";
+  for(const n of room.npcs)  if(n.x===x&&n.y===y) return "npc";
+  return null;
+}
+function isDoor(r,x,y){ return !!rooms[r].doors[x+","+y]; }
+function blocked(x,y){
+  if(x<0||y<0||x>=COLS||y>=ROWS) return true;
+  const border = (x===0||y===0||x===COLS-1||y===ROWS-1);
+  if(border && !isDoor(cur,x,y)) return true;
+  if(occupant(cur,x,y)) return true;
+  return false;
+}
+
+// ---- 繪圖 ----
+function shadow(px,py){
+  ctx.save(); ctx.fillStyle="rgba(70,50,30,.15)";
+  ctx.beginPath(); ctx.ellipse(px,py+14,15,6,0,0,7); ctx.fill(); ctx.restore();
+}
+function draw(){
+  const room=rooms[cur];
+  ctx.clearRect(0,0,cv.width,cv.height);
+  // 地板 + 牆
+  for(let y=0;y<ROWS;y++)for(let x=0;x<COLS;x++){
+    const px=x*TILE, py=y*TILE;
+    const border=(x===0||y===0||x===COLS-1||y===ROWS-1);
+    if(border && !isDoor(cur,x,y)){
+      ctx.fillStyle="#c9b79c"; ctx.fillRect(px,py,TILE,TILE);
+      ctx.fillStyle="#bda683"; ctx.fillRect(px+2,py+2,TILE-4,TILE-4);
+    } else if(isDoor(cur,x,y)){
+      ctx.fillStyle="#8a6b45"; ctx.fillRect(px,py,TILE,TILE);
+      ctx.font="24px serif";ctx.textAlign="center";ctx.textBaseline="middle";
+      ctx.fillText("🚪",px+TILE/2,py+TILE/2);
+    } else {
+      ctx.fillStyle=(x+y)%2?room.floorA:room.floorB; ctx.fillRect(px,py,TILE,TILE);
+    }
+  }
+  // 佈置模式格線
+  if(building){
+    ctx.strokeStyle="rgba(200,130,43,.35)";
+    for(let y=1;y<ROWS-1;y++)for(let x=1;x<COLS-1;x++){
+      if(!occupant(cur,x,y)&&!isDoor(cur,x,y))
+        ctx.strokeRect(x*TILE+2,y*TILE+2,TILE-4,TILE-4);
+    }
+  }
+  ctx.font="28px serif";ctx.textAlign="center";ctx.textBaseline="middle";
+  const drawThing=(x,y,e,sz=28)=>{const px=x*TILE+TILE/2,py=y*TILE+TILE/2;
+    shadow(px,py);ctx.font=sz+"px serif";ctx.fillText(e,px,py-2);};
+  room.fixed.forEach(f=>drawThing(f.x,f.y,f.e));
+  room.furn.forEach(f=>drawThing(f.x,f.y,f.e,26));
+  room.npcs.forEach(n=>{drawThing(n.x,n.y,n.e);
+    ctx.font="14px serif";ctx.fillText("💬",n.x*TILE+TILE-9,n.y*TILE+9);});
+  // 玩家
+  drawThing(player.x,player.y,"🧑‍⚕️");
+  const cx=player.x*TILE+TILE/2+player.dir.x*15, cy=player.y*TILE+TILE/2+player.dir.y*15;
+  ctx.fillStyle="var(--accent2)";ctx.fillStyle="#c9822b";
+  ctx.beginPath();ctx.arc(cx,cy,3,0,7);ctx.fill();
+  updateHud();
+}
+function updateHud(){
+  document.getElementById('roomName').textContent=rooms[cur].name;
+  const c=comfortOf(cur);
+  document.getElementById('comfort').style.width=c+"%";
+  const moodEl=document.getElementById('mood');
+  if(!isPatientRoom(cur)) moodEl.textContent="—";
+  else moodEl.textContent = c>=80?"😄 很好":c>=60?"🙂 還行":"😟 空盪";
+}
+
+// ---- 移動 / 換房 ----
+function move(dx,dy){
+  if(busy) return;
+  player.dir={x:dx,y:dy};
+  const nx=player.x+dx, ny=player.y+dy;
+  if(blocked(nx,ny)){draw();return;}
+  player.x=nx; player.y=ny;
+  const d=rooms[cur].doors[nx+","+ny];
+  if(d){ cur=d.to; player.x=d.ex[0]; player.y=d.ex[1]; }
+  draw();
+}
+
+// ---- 互動 ----
+function interact(){
+  if(busy) return;
+  const tx=player.x+player.dir.x, ty=player.y+player.dir.y;
+  const n=rooms[cur].npcs.find(n=>n.x===tx&&n.y===ty);
+  if(!n) return;
+  let line;
+  if(n.fixed){
+    const total=rooms[1].furn.length+rooms[2].furn.length;
+    line=`辛苦了新人！試試走進病房，按「🔨佈置模式」擺些家具，讓病人住得舒服點。<br>（目前你總共佈置了 <b>${total}</b> 件家具）`;
+  } else {
+    const c=comfortOf(cur);
+    if(c>=80) line="哎呀，這病房好溫馨，我心情都好起來了，謝謝你！😊";
+    else if(c>=60) line="嗯…感覺比剛才舒服一些了，謝謝你費心。";
+    else line="這房間空盪盪的，有點冷清呢…（也許可以擺點盆栽或玩偶？）";
+  }
+  dialog(n.name, line);
+}
+function dialog(name,text){
+  busy=true; document.getElementById('ov').style.display='flex';
+  document.getElementById('who').innerHTML=name;
+  document.getElementById('say').innerHTML=text;
+  onCont=()=>{busy=false;document.getElementById('ov').style.display='none';draw();};
+}
+document.getElementById('cbtn').onclick=()=>{if(onCont){const f=onCont;onCont=null;f();}};
+
+// ---- 佈置模式 ----
+function toggleBuild(){
+  building=!building;
+  document.getElementById('tray').classList.toggle('on',building);
+  document.getElementById('buildBtn').textContent=building?"✅ 完成佈置":"🔨 佈置模式";
+  draw();
+}
+document.getElementById('buildBtn').onclick=toggleBuild;
+document.getElementById('talkBtn').onclick=interact;
+
+// 家具欄
+const ftrow=document.getElementById('ftrow');
+FURN.forEach((f,i)=>{
+  const b=document.createElement('button');
+  b.className="fbtn"+(i===0?" sel":""); b.textContent=f.e; b.title=f.n;
+  b.onclick=()=>{selFurn=i;[...ftrow.children].forEach((c,j)=>c.classList.toggle('sel',j===i));};
+  ftrow.appendChild(b);
+});
+
+// 點畫布擺放 / 移除
+cv.addEventListener('click',e=>{
+  if(!building||busy) return;
+  const rect=cv.getBoundingClientRect();
+  const x=Math.floor((e.clientX-rect.left)/rect.width*COLS);
+  const y=Math.floor((e.clientY-rect.top)/rect.height*ROWS);
+  if(x<=0||y<=0||x>=COLS-1||y>=ROWS-1) return;
+  if(isDoor(cur,x,y)) return;
+  const room=rooms[cur];
+  // 移除既有擺設
+  const fi=room.furn.findIndex(f=>f.x===x&&f.y===y);
+  if(fi>=0){ room.furn.splice(fi,1); draw(); return; }
+  // 不可疊在固定物/NPC/玩家上
+  if(occupant(cur,x,y)) return;
+  if(player.x===x&&player.y===y) return;
+  room.furn.push({x,y,e:FURN[selFurn].e});
+  draw();
+});
+
+// ---- 鍵盤 ----
+window.addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if(busy){ if(k==='enter'||k===' '){e.preventDefault();if(onCont){const f=onCont;onCont=null;f();}} return; }
+  if(k==='arrowup'||k==='w'){e.preventDefault();move(0,-1);}
+  else if(k==='arrowdown'||k==='s'){e.preventDefault();move(0,1);}
+  else if(k==='arrowleft'||k==='a'){e.preventDefault();move(-1,0);}
+  else if(k==='arrowright'||k==='d'){e.preventDefault();move(1,0);}
+  else if(k==='b'){toggleBuild();}
+  else if(k===' '||k==='enter'||k==='e'){e.preventDefault();interact();}
+});
+document.querySelectorAll('.dpad button').forEach(b=>{
+  b.onclick=()=>{const d=b.dataset.d;
+    if(d==='up')move(0,-1);else if(d==='down')move(0,1);
+    else if(d==='left')move(-1,0);else if(d==='right')move(1,0);
+    else interact();};
+});
+
+draw();
+</script>

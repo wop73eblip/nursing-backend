@@ -1,0 +1,335 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>新人護理師的一天 · 三讀五對訓練</title>
+<style>
+  :root{
+    --bg:#0e1726; --panel:#152238; --panel2:#1c2c47; --line:#2b3d5f;
+    --txt:#e8eef7; --muted:#93a4c0; --accent:#38bdf8; --accent2:#22d3ee;
+    --good:#34d399; --bad:#f87171; --warn:#fbbf24; --pill:#25344f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Segoe UI","Microsoft JhengHei",system-ui,sans-serif;
+    background:radial-gradient(1200px 600px at 70% -10%,#1a2b47,transparent),var(--bg);
+    color:var(--txt);min-height:100vh;display:flex;justify-content:center}
+  .wrap{width:100%;max-width:760px;padding:18px}
+  h1{font-size:20px;margin:0}
+  .sub{color:var(--muted);font-size:13px;margin-top:2px}
+  .topbar{display:flex;gap:10px;align-items:center;justify-content:space-between;margin:14px 0}
+  .stats{display:flex;gap:8px;flex-wrap:wrap}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:6px 12px;font-size:13px;min-width:74px;text-align:center}
+  .stat b{display:block;font-size:18px;margin-top:2px}
+  .bar{height:8px;background:var(--pill);border-radius:99px;overflow:hidden;flex:1;margin:0 4px}
+  .bar > i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:100%;transition:width .3s}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;margin-bottom:14px}
+  .patient{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .band{background:var(--panel2);border:1px dashed var(--accent);border-radius:10px;
+    padding:8px 12px;font-size:13px;line-height:1.7}
+  .band .k{color:var(--muted)}
+  .vit{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .vpill{background:var(--pill);border-radius:8px;padding:5px 10px;font-size:13px}
+  .vpill.alert{color:#0e1726;background:var(--warn);font-weight:700}
+  h3{font-size:14px;color:var(--accent2);margin:16px 0 8px;letter-spacing:.5px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  td,th{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left}
+  th{color:var(--muted);font-weight:600;font-size:12px}
+  .chk{display:flex;gap:6px}
+  .mini{border:1px solid var(--line);background:var(--panel2);color:var(--txt);
+    border-radius:8px;padding:5px 10px;cursor:pointer;font-size:13px;transition:.15s}
+  .mini:hover{border-color:var(--accent)}
+  .mini.pick-ok{background:var(--good);color:#04231a;border-color:var(--good);font-weight:700}
+  .mini.pick-no{background:var(--bad);color:#2a0606;border-color:var(--bad);font-weight:700}
+  .actions{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap}
+  .btn{flex:1;min-width:130px;border:none;border-radius:12px;padding:14px;font-size:15px;
+    font-weight:700;cursor:pointer;transition:.15s}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .btn.give{background:var(--good);color:#04231a}
+  .btn.hold{background:var(--warn);color:#3a2900}
+  .btn.stop{background:var(--bad);color:#fff}
+  .btn.next{background:var(--accent);color:#04283a}
+  .btn:not(:disabled):hover{transform:translateY(-1px)}
+  .feedback{margin-top:14px;padding:14px;border-radius:12px;font-size:14px;line-height:1.7;display:none}
+  .feedback.ok{background:rgba(52,211,153,.12);border:1px solid var(--good)}
+  .feedback.err{background:rgba(248,113,113,.12);border:1px solid var(--bad)}
+  .feedback b{color:var(--accent2)}
+  .center{text-align:center}
+  .lead{color:var(--muted);line-height:1.9;font-size:14px}
+  .hide{display:none}
+  .tag{display:inline-block;background:var(--pill);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--muted)}
+  .diff{color:var(--warn)}
+  ul{line-height:1.9;padding-left:20px}
+  .grade{font-size:52px;font-weight:800;margin:6px 0}
+</style>
+
+<div class="wrap">
+
+  <!-- 開始畫面 -->
+  <div id="start" class="card center">
+    <h1>🏥 新人護理師的一天</h1>
+    <p class="sub">三讀五對 · 給藥安全訓練原型</p>
+    <p class="lead" style="text-align:left">
+      你是剛上線的新人護理師，今天負責給藥。<br><br>
+      每位病人都有一張<b>醫囑</b>，你手上有<b>準備好的藥</b>。你的任務：<br>
+      ① 逐項核對「<b>五對</b>」——病人、藥物、劑量、時間、途徑，判斷每一項是否相符。<br>
+      ② 檢查<b>生命徵象</b>，判斷是否需要暫停通報。<br>
+      ③ 做出決定：<b>給藥 / 暫停通報 / 退藥重配</b>。<br><br>
+      給錯藥會扣病人安全分。撐過整個班別，看看你能不能安全下班！
+    </p>
+    <button class="btn next" style="max-width:220px" onclick="startGame()">開始上班 ▶</button>
+  </div>
+
+  <!-- 遊戲畫面 -->
+  <div id="game" class="hide">
+    <div class="center">
+      <h1>💊 給藥核對</h1>
+    </div>
+    <div class="topbar">
+      <span class="tag">進度</span>
+      <div class="bar"><i id="prog"></i></div>
+      <span id="progtxt" class="tag">1 / 6</span>
+    </div>
+    <div class="stats" style="justify-content:center;margin-bottom:14px">
+      <div class="stat">病人安全<b id="safe">100</b></div>
+      <div class="stat">用藥正確<b id="acc">—</b></div>
+      <div class="stat">已處理<b id="done">0</b></div>
+    </div>
+
+    <div class="card">
+      <div class="patient">
+        <div>
+          <div style="font-size:16px;font-weight:700" id="pname">王大明</div>
+          <div class="sub" id="pdx">診斷：—</div>
+        </div>
+        <div class="band" id="band"></div>
+      </div>
+      <div class="vit" id="vitals"></div>
+
+      <h3>📋 五對核對（點選判斷每一項是否相符）</h3>
+      <table>
+        <thead><tr><th>核對項目</th><th>醫囑</th><th>手上的藥／病人</th><th>你的判斷</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+
+      <div class="actions">
+        <button class="btn give" id="bGive" onclick="decide('give')">✅ 給藥</button>
+        <button class="btn hold" id="bHold" onclick="decide('hold')">⏸️ 暫停通報</button>
+        <button class="btn stop" id="bStop" onclick="decide('stop')">🛑 退藥重配</button>
+      </div>
+
+      <div class="feedback" id="fb"></div>
+      <div class="center hide" id="nextwrap" style="margin-top:14px">
+        <button class="btn next" style="max-width:220px" onclick="nextCase()">下一位病人 ▶</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 交班/結算畫面 -->
+  <div id="end" class="hide card center">
+    <h1>📝 交班報告</h1>
+    <div class="grade" id="grade">A</div>
+    <p class="sub" id="verdict"></p>
+    <div style="text-align:left" class="lead" id="report"></div>
+    <button class="btn next" style="max-width:220px;margin-top:10px" onclick="location.reload()">再上一班 🔁</button>
+  </div>
+
+</div>
+
+<script>
+/* ---------- 案例資料（真實給藥情境） ---------- */
+const CASES = [
+  {
+    name:"王大明", id:"A012345", dx:"高血壓",
+    order:{病人:"王大明 (A012345)", 藥物:"Amlodipine 脈優", 劑量:"5 mg", 時間:"08:00", 途徑:"口服 PO"},
+    tray :{病人:"王大明 (A012345)", 藥物:"Amlodipine 脈優", 劑量:"5 mg", 時間:"08:00", 途徑:"口服 PO"},
+    vitals:{HR:"78 次/分",SBP:"146 mmHg",Temp:"36.6°C"}, alerts:[],
+    answer:"give",
+    why:"五對完全相符，生命徵象無禁忌，正確做法是<b>給藥</b>。這是最基本的正確流程，別因為緊張而遲疑。"
+  },
+  {
+    name:"李美華", id:"B067890", dx:"糖尿病",
+    order:{病人:"李美華 (B067890)", 藥物:"Metformin", 劑量:"500 mg", 時間:"08:00", 途徑:"口服 PO"},
+    tray :{病人:"李美惠 (B067899)", 藥物:"Metformin", 劑量:"500 mg", 時間:"08:00", 途徑:"口服 PO"},
+    vitals:{HR:"80 次/分",SBP:"128 mmHg",Temp:"36.8°C"}, alerts:[],
+    answer:"stop", wrongKeys:["病人"],
+    why:"<b>病人不對！</b>手圈是「李美<span class='diff'>惠</span> (B0678<span class='diff'>99</span>)」，醫囑是「李美華 (B067890)」——名字相近、病歷號差兩碼。這是最危險的錯誤，務必<b>退藥並重新確認病人身分</b>（姓名＋病歷號雙重核對）。"
+  },
+  {
+    name:"陳志強", id:"C011223", dx:"感染，抗生素治療",
+    order:{病人:"陳志強 (C011223)", 藥物:"Amoxicillin", 劑量:"500 mg", 時間:"12:00", 途徑:"口服 PO"},
+    tray :{病人:"陳志強 (C011223)", 藥物:"Amoxicillin", 劑量:"250 mg", 時間:"12:00", 途徑:"口服 PO"},
+    vitals:{HR:"88 次/分",SBP:"120 mmHg",Temp:"37.9°C"}, alerts:[],
+    answer:"stop", wrongKeys:["劑量"],
+    why:"<b>劑量不對！</b>醫囑 500 mg，手上只有 250 mg（少一半）。劑量錯誤會影響療效或造成過量，須<b>退藥重配</b>正確劑量。"
+  },
+  {
+    name:"張淑芬", id:"D044556", dx:"心房顫動",
+    order:{病人:"張淑芬 (D044556)", 藥物:"Digoxin 毛地黃", 劑量:"0.25 mg", 時間:"09:00", 途徑:"口服 PO"},
+    tray :{病人:"張淑芬 (D044556)", 藥物:"Digoxin 毛地黃", 劑量:"0.25 mg", 時間:"09:00", 途徑:"口服 PO"},
+    vitals:{HR:"52 次/分",SBP:"118 mmHg",Temp:"36.5°C"}, alerts:["HR"],
+    answer:"hold",
+    why:"五對雖然全對，但<b>心跳只有 52 次/分（過慢）</b>。Digoxin 會再減慢心跳，給藥前應確認心跳；心跳 < 60 應<b>暫停並通報醫師</b>。這一題在教你：五對之外還要有臨床判斷。"
+  },
+  {
+    name:"林建宏", id:"E078901", dx:"術後止痛",
+    order:{病人:"林建宏 (E078901)", 藥物:"Morphine 嗎啡", 劑量:"5 mg", 時間:"14:00", 途徑:"靜脈注射 IV", 說明:"IV 緩慢注射"},
+    tray :{病人:"林建宏 (E078901)", 藥物:"Morphine 嗎啡", 劑量:"5 mg", 時間:"14:00", 途徑:"肌肉注射 IM"},
+    vitals:{HR:"76 次/分",SBP:"122 mmHg",Temp:"36.7°C"}, alerts:[],
+    answer:"stop", wrongKeys:["途徑"],
+    why:"<b>途徑不對！</b>醫囑是靜脈注射（IV），手上準備成肌肉注射（IM）。給藥途徑錯誤會改變藥效與安全性，尤其管制藥品更要謹慎，須<b>退藥並重新依醫囑準備</b>。"
+  },
+  {
+    name:"黃春嬌", id:"F090112", dx:"胃潰瘍",
+    order:{病人:"黃春嬌 (F090112)", 藥物:"Omeprazole", 劑量:"20 mg", 時間:"睡前 HS (22:00)", 途徑:"口服 PO"},
+    tray :{病人:"黃春嬌 (F090112)", 藥物:"Omeprazole", 劑量:"20 mg", 時間:"08:00 早上", 途徑:"口服 PO"},
+    vitals:{HR:"72 次/分",SBP:"116 mmHg",Temp:"36.6°C"}, alerts:[],
+    answer:"stop", wrongKeys:["時間"],
+    why:"<b>時間不對！</b>醫囑為睡前給藥（HS），現在卻在早上要給。給藥時間錯誤會影響藥效並可能造成重複給藥，應<b>退藥並依正確時間給藥</b>。"
+  }
+];
+
+const KEYS = ["病人","藥物","劑量","時間","途徑"];
+let idx=0, safe=100, correctCount=0, judged={}, decided=false;
+const log=[];
+
+function startGame(){
+  document.getElementById('start').classList.add('hide');
+  document.getElementById('game').classList.remove('hide');
+  render();
+}
+
+function render(){
+  const c=CASES[idx];
+  decided=false; judged={};
+  document.getElementById('pname').textContent=`${c.name}　床號 ${idx+1}`;
+  document.getElementById('pdx').textContent=`診斷：${c.dx}`;
+  document.getElementById('band').innerHTML=
+    `<div><span class="k">🪪 手圈</span>　${c.tray.病人}</div>`+
+    `<div><span class="k">📋 醫囑病人</span>　${c.order.病人}</div>`;
+
+  // vitals
+  const vwrap=document.getElementById('vitals'); vwrap.innerHTML='';
+  for(const [k,v] of Object.entries(c.vitals)){
+    const alert=c.alerts.includes(k);
+    vwrap.insertAdjacentHTML('beforeend',
+      `<span class="vpill ${alert?'alert':''}">${k}：${v}${alert?' ⚠':''}</span>`);
+  }
+
+  // rows
+  const rows=document.getElementById('rows'); rows.innerHTML='';
+  KEYS.forEach(k=>{
+    const ov = k==="病人" ? c.order.病人 : c.order[k];
+    const tv = k==="病人" ? c.tray.病人  : c.tray[k];
+    rows.insertAdjacentHTML('beforeend',
+      `<tr>
+        <td><b>${k}對</b></td>
+        <td>${ov||'—'}</td>
+        <td>${tv||'—'}</td>
+        <td><div class="chk">
+          <button class="mini" id="ok_${k}" onclick="judge('${k}','ok')">符合 ✓</button>
+          <button class="mini" id="no_${k}" onclick="judge('${k}','no')">不符 ✗</button>
+        </div></td>
+      </tr>`);
+  });
+
+  document.getElementById('fb').style.display='none';
+  document.getElementById('nextwrap').classList.add('hide');
+  ['bGive','bHold','bStop'].forEach(id=>document.getElementById(id).disabled=false);
+
+  // progress + stats
+  document.getElementById('prog').style.width=`${idx/CASES.length*100}%`;
+  document.getElementById('progtxt').textContent=`${idx+1} / ${CASES.length}`;
+  document.getElementById('safe').textContent=safe;
+  document.getElementById('done').textContent=idx;
+  const total=idx;
+  document.getElementById('acc').textContent = total? Math.round(correctCount/total*100)+'%' : '—';
+}
+
+function judge(k,v){
+  if(decided) return;
+  judged[k]=v;
+  document.getElementById('ok_'+k).classList.toggle('pick-ok', v==='ok');
+  document.getElementById('ok_'+k).classList.remove('pick-no');
+  document.getElementById('no_'+k).classList.toggle('pick-no', v==='no');
+  document.getElementById('no_'+k).classList.remove('pick-ok');
+}
+
+function decide(action){
+  if(decided) return;
+  decided=true;
+  const c=CASES[idx];
+  ['bGive','bHold','bStop'].forEach(id=>document.getElementById(id).disabled=true);
+
+  const correctAction = c.answer;
+  const actionOk = action===correctAction;
+
+  // 五對判斷正確性
+  const wrongKeys = c.wrongKeys||[];
+  let allJudgedRight=true, unjudged=false;
+  KEYS.forEach(k=>{
+    const shouldBe = wrongKeys.includes(k) ? 'no' : 'ok';
+    if(!judged[k]) unjudged=true;
+    else if(judged[k]!==shouldBe) allJudgedRight=false;
+  });
+
+  const fb=document.getElementById('fb');
+  fb.style.display='block';
+  let penalty=0, head='';
+
+  if(actionOk){
+    correctCount++;
+    fb.className='feedback ok';
+    head = `<b>✔ 判斷正確！</b><br>`;
+    if(!allJudgedRight||unjudged){
+      head += `<span style="color:var(--warn)">（提醒：最終決定對了，但五對逐項核對有疏漏——養成每一項都確實核對的習慣，才不會有漏網之魚。）</span><br>`;
+    }
+  }else{
+    fb.className='feedback err';
+    // 給錯藥最嚴重
+    if(action==='give' && correctAction!=='give'){ penalty=25; }
+    else if(correctAction==='give'){ penalty=8; } // 該給卻退，延誤照護
+    else { penalty=12; }
+    safe=Math.max(0,safe-penalty);
+    head = `<b>✘ 判斷需要修正（病人安全 −${penalty}）</b><br>`;
+  }
+  fb.innerHTML = head + c.why +
+    `<br><br><span class="tag">正確做法：${labelOf(correctAction)}</span>`;
+
+  log.push({name:c.name, ok:actionOk, correct:labelOf(correctAction)});
+
+  document.getElementById('safe').textContent=safe;
+  document.getElementById('nextwrap').classList.remove('hide');
+}
+
+function labelOf(a){return a==='give'?'給藥':a==='hold'?'暫停通報醫師':'退藥重配';}
+
+function nextCase(){
+  idx++;
+  if(idx>=CASES.length){ endShift(); return; }
+  render();
+}
+
+function endShift(){
+  document.getElementById('game').classList.add('hide');
+  const end=document.getElementById('end'); end.classList.remove('hide');
+  const acc=Math.round(correctCount/CASES.length*100);
+  let grade,verdict;
+  if(safe>=90&&acc>=90){grade='A＋';verdict='安全下班！你是值得信賴的護理師 🌟';}
+  else if(safe>=70&&acc>=70){grade='B';verdict='大致安全，但仍有需要加強的核對細節。';}
+  else if(safe>=50){grade='C';verdict='今天有驚無險，回去複習三讀五對吧。';}
+  else{grade='D';verdict='發生了危及病人的給藥錯誤，務必重新訓練！';}
+  document.getElementById('grade').textContent=grade;
+  document.getElementById('verdict').textContent=verdict;
+
+  let html=`<h3>本班摘要</h3>
+    <span class="tag">病人安全 ${safe}/100</span>
+    <span class="tag">用藥正確率 ${acc}%</span>
+    <h3>逐床交班</h3><ul>`;
+  log.forEach((l,i)=>{
+    html+=`<li>${i+1}. ${l.name}：${l.ok?'✅ 處理正確':'⚠️ 判斷失誤'}（正確做法：${l.correct}）</li>`;
+  });
+  html+=`</ul><h3>給新人的話</h3>
+    <p class="lead">「三讀」是準備、取用、歸位時各讀一次藥籤；「五對」是病人、藥物、劑量、時間、途徑。
+    真正的高手，是把每一次核對都當成第一次一樣認真。💙</p>`;
+  document.getElementById('report').innerHTML=html;
+}
+</script>
