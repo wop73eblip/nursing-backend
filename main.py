@@ -761,9 +761,10 @@ def generate_schedule(
     # 內建原則：已填班別（含未確認）一律保留，只填寫空白格子
     overwrite_confirmed = False
 
-    # 權重版本：smooth=順班優先（切換懲罰×2）；fair=公平優先（比例/公平懲罰×2）
-    SWITCH_MULT = 2 if profile == "smooth" else 1
-    FAIR_MULT   = 2 if profile == "fair" else 1
+    # 權重版本：smooth=順班優先（切換懲罰×倍率）；fair=公平優先（比例/公平懲罰×倍率）
+    # 倍率預設 smooth=2、fair=2；可用 env SMOOTH_SWITCH_MULT / FAIR_DIST_MULT 微調（回測用）
+    SWITCH_MULT = float(os.getenv("SMOOTH_SWITCH_MULT", "2")) if profile == "smooth" else 1.0
+    FAIR_MULT   = float(os.getenv("FAIR_DIST_MULT",   "2")) if profile == "fair"   else 1.0
 
     # 除錯用：DEBUG_SKIP_RULES=rule4,one17,... 可停用特定硬規則群組（生產環境不設定即無作用）
     DEBUG_SKIP = set(filter(None, os.getenv("DEBUG_SKIP_RULES", "").split(",")))
@@ -1286,7 +1287,7 @@ def generate_schedule(
                 assume_reg.append((_a_s1, f"{_snames_diag[si]}需恰好{req}人（不含行政班）— {cycle_dates[t]}"))
 
     # ── 軟規則：順班目標 + 固定班偏離懲罰 + leader/second 出勤偏好
-    FIX_PENALTY = 500
+    FIX_PENALTY = int(os.getenv("FIX_PENALTY", "500"))
     # 固定班最多允許偏離的格數（硬上限），由「允許固定班偏離」規則控制：
     #   勾選(allow_fixed_deviation=True)＝最多偏離 2 格；未勾＝0（固定班完全不可偏離）。
     # fair（公平優先版）一律嚴格 0（固定D只排D）；逃生閥 FAIR_FIX_DEV 可放寬 fair。
@@ -1335,7 +1336,8 @@ def generate_schedule(
             model.add(_min_sk <= sv)
         _sk_spread = model.new_int_var(0, 2, "slack_spread")
         model.add(_sk_spread == _max_sk - _min_sk)
-        penalties.append(_sk_spread * 400 * FAIR_MULT)
+        _SK_SPREAD_BASE = int(os.getenv("SKILL_SPREAD_PENALTY", "400"))
+        penalties.append(_sk_spread * int(_SK_SPREAD_BASE * FAIR_MULT))
     # leader/second 軟約束懲罰
     for miss_var, pen in leader_miss_vars:
         penalties.append(miss_var * pen)
@@ -1348,7 +1350,7 @@ def generate_schedule(
         # 直接懲罰班種之間的差值，不依賴固定工作天數目標
         # 當 off_slack 被啟用時工作天增加，差值約束仍能維持比例平衡
         # 另設硬上限：全職、半職每班種偏差皆 ≤ ±2 天（預填鎖定已超過時自動讓路）
-        DIST_PENALTY = 900 * FAIR_MULT
+        DIST_PENALTY = int(int(os.getenv("DIST_PENALTY", "900")) * FAIR_MULT)
         _is_ht_m = bool(nurses[m].get("halftime"))
         _cap_days = 2   # 全職、半職皆 ±2（各班種偏離理想 ±2 天）
         _locked_cnt = locked_si_counts_per_m.get(m, [0, 0, 0])
@@ -1390,7 +1392,7 @@ def generate_schedule(
             pass  # 固定班由 FIX_PENALTY 處理
 
         # ── 軟規則：孤立上班日懲罰（OFF-上班-OFF，出來上一天班很累）
-        ISOLATED_WORK_PENALTY = 750
+        ISOLATED_WORK_PENALTY = int(os.getenv("ISOLATED_WORK_PENALTY", "750"))
         for t in range(1, n - 1):
             iso = model.new_bool_var(f"isowork_{m}_{t}")
             work_t = sum(b[m][t][s] for s in range(3))
@@ -1564,8 +1566,8 @@ def generate_schedule(
         model.add_assumptions([lit for lit, _ in assume_reg])
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 90
-    solver.parameters.num_workers = 4
+    solver.parameters.max_time_in_seconds = float(os.getenv("MAIN_SOLVE_SECONDS", "90"))
+    solver.parameters.num_workers = int(os.getenv("MAIN_SOLVE_WORKERS", "4"))
     status = solver.solve(model)
     print(f"[SOLVE] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
 
@@ -1873,6 +1875,8 @@ def generate_schedule(
             "excess_switches": metric_excess,
             "isolated_days": metric_isolated,
             "max_ratio_dev": metric_max_dev,
+            "objective_value": (solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None),
+            "solver_wall_time": round(solver.wall_time, 2),
         },
     }
 
