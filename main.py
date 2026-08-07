@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -748,6 +748,7 @@ def delete_game_message(
 def generate_schedule(
     overwrite_confirmed: bool = False,
     profile: str = "balanced",   # smooth=順班優先 / fair=公平優先 / balanced=預設
+    body: dict = Body(default={}),   # 可選 body：{"hint_schedules": {uid: {date: shift}}} 供暖啟動
     current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
 ):
     """
@@ -1564,6 +1565,29 @@ def generate_schedule(
     # 一旦無解，可用 solver.sufficient_assumptions_for_infeasibility() 反查互相矛盾的規則。
     if assume_reg:
         model.add_assumptions([lit for lit, _ in assume_reg])
+
+    # ── 暖啟動：若 body 帶入上次結果，餵給 solver 當 hint（僅提示、不強制；被硬約束反駁時自動忽略）
+    _hint_schedules = (body or {}).get("hint_schedules") or {}
+    if _hint_schedules and "hint" not in DEBUG_SKIP:
+        _hint_count = 0
+        for _mi, _nu in enumerate(nurses):
+            _uid = _nu.get("uid")
+            _hs = _hint_schedules.get(_uid) if _uid else None
+            if not _hs:
+                continue
+            for _t in range(n):
+                _sh = _hs.get(cycle_dates[_t])
+                if not _sh:
+                    continue
+                if _sh in SI:                # D/E/N
+                    _hv = SI[_sh]
+                elif _sh in REST_CODES:      # OFF、半 等應休 → 3
+                    _hv = 3
+                else:
+                    continue                  # 放假/調整類已由鎖定處理，不重複 hint
+                model.add_hint(x[_mi][_t], _hv)
+                _hint_count += 1
+        print(f"[HINT] warm-start with {_hint_count} cell hints from previous result")
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(os.getenv("MAIN_SOLVE_SECONDS", "90"))
