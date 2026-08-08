@@ -1469,13 +1469,15 @@ def generate_schedule(
 
     # ── 求解前診斷
     print(f"\n[SOLVE] 護理師={M} 週期={n}天 需求D/E/N={daily_d}/{daily_e}/{daily_n}")
-    print(f"[SOLVE] 總工作需求={total_work_demand}  總可提供={sum((n - (part_off if nurses[m].get('halftime') else full_off)) for m in range(M))}")
+    _M_clin = M - len(trainee_set)   # 臨床人數（不含新人）
+    print(f"[SOLVE] 總工作需求={total_work_demand}  臨床可提供={sum((n - (part_off if nurses[m].get('halftime') else full_off)) for m in range(M) if m not in trainee_set)}  (M={M} 含 {len(trainee_set)} 新人)")
     print(f"[SOLVE] 反向班={no_reverse} 一例一休={one_in_seven} 連班上限={max_consec} full_off={full_off} part_off={part_off}")
     print(f"[SOLVE] 變數數={model.proto.variables.__len__()}  約束數={len(model.proto.constraints)}")
     # 各班可排護理師數
-    cap_d = sum(1 for m in range(M) if 0 in {SI.get(s) for s in SHIFT_ALLOWED.get(nurses[m].get("attr","輪班DEN"), WORK_SHIFTS)})
-    cap_e = sum(1 for m in range(M) if 1 in {SI.get(s) for s in SHIFT_ALLOWED.get(nurses[m].get("attr","輪班DEN"), WORK_SHIFTS)})
-    cap_n = sum(1 for m in range(M) if 2 in {SI.get(s) for s in SHIFT_ALLOWED.get(nurses[m].get("attr","輪班DEN"), WORK_SHIFTS)})
+    # 各班可排「臨床」人數（不含新人；新人不佔臨床人力名額）
+    cap_d = sum(1 for m in range(M) if m not in trainee_set and 0 in {SI.get(s) for s in SHIFT_ALLOWED.get(nurses[m].get("attr","輪班DEN"), WORK_SHIFTS)})
+    cap_e = sum(1 for m in range(M) if m not in trainee_set and 1 in {SI.get(s) for s in SHIFT_ALLOWED.get(nurses[m].get("attr","輪班DEN"), WORK_SHIFTS)})
+    cap_n = sum(1 for m in range(M) if m not in trainee_set and 2 in {SI.get(s) for s in SHIFT_ALLOWED.get(nurses[m].get("attr","輪班DEN"), WORK_SHIFTS)})
     print(f"[SOLVE] 可排D班護理師={cap_d}人（需求{daily_d}）可排E班={cap_e}人（需求{daily_e}）可排N班={cap_n}人（需求{daily_n}）")
     for m in range(M):
         attr = nurses[m].get("attr","?")
@@ -1653,22 +1655,24 @@ def generate_schedule(
         if M < max_daily_demand:
             violations.append(f"護理師總數（{M}人）少於單日最高需求（{max_daily_demand}人）")
 
-        # 2. 每位護理師可排工作天數 vs 總工作需求
+        # 2. 每位臨床護理師可排工作天數 vs 總工作需求（新人不佔臨床人力名額，故不計入）
         # 可排工作天數上限 = n - 最少休假天數
         min_off_per_nurse = max(1, n // 7)  # 每週至少 1 天休
         max_work_per_nurse = n - min_off_per_nurse
-        max_total_work = M * max_work_per_nurse
+        M_clin = M - len(trainee_set)
+        max_total_work = M_clin * max_work_per_nurse
         if total_work_demand > max_total_work:
             violations.append(
-                f"總工作需求（{total_work_demand}班次）超過所有護理師可排上限"
-                f"（{M}人 × {max_work_per_nurse}天 = {max_total_work}班次）"
+                f"總工作需求（{total_work_demand}班次）超過臨床護理師可排上限"
+                f"（{M_clin}人 × {max_work_per_nurse}天 = {max_total_work}班次；不含新人）"
             )
 
-        # 3. 每日各班需求 vs 可排該班護理師數
+        # 3. 每日各班需求 vs 可排該班「臨床」護理師數（不含新人）
         def capable_for(si: int) -> int:
             return sum(
                 1 for m in range(M)
-                if si in {SI.get(s) for s in SHIFT_ALLOWED.get(nurses[m].get("attr", "輪班DEN"), WORK_SHIFTS)}
+                if m not in trainee_set
+                and si in {SI.get(s) for s in SHIFT_ALLOWED.get(nurses[m].get("attr", "輪班DEN"), WORK_SHIFTS)}
             )
         capable_d = capable_for(0)
         capable_e = capable_for(1)
@@ -1693,15 +1697,15 @@ def generate_schedule(
         if max_consec_off_val < 1:
             violations.append("連續休假上限不可為 0")
 
-        # 5b. 一例一休（硬規則）：每人每週至少 2 天休 → 可排天數上限下降，可能導致人力不足
+        # 5b. 一例一休（硬規則）：每位臨床護理師每週至少 2 天休 → 可排天數上限下降（不含新人）
         if one_in_seven:
             num_weeks = max(1, len(weeks))
             max_work_2off = max(0, n - 2 * num_weeks)
-            if total_work_demand > M * max_work_2off:
+            if total_work_demand > M_clin * max_work_2off:
                 violations.append(
                     f"「一例一休」為硬規則（每人每週至少 2 天休）使可排天數下降："
-                    f"總工作需求（{total_work_demand}班次）超過可排上限"
-                    f"（{M}人 × {max_work_2off}天 = {M * max_work_2off}班次）。"
+                    f"總工作需求（{total_work_demand}班次）超過臨床可排上限"
+                    f"（{M_clin}人 × {max_work_2off}天 = {M_clin * max_work_2off}班次；不含新人）。"
                     f"建議取消勾選一例一休、增加人力或降低各班需求人數"
                 )
 
@@ -1783,7 +1787,8 @@ def generate_schedule(
                     break
             else:
                 consec = 0
-    leader_indices = [i for i, n in enumerate(nurses) if n.get("level") == "leader"]
+    # 新人不計臨床人數（H15）；leader/人數驗證都排除
+    leader_indices = [i for i, n in enumerate(nurses) if n.get("level") == "leader" and i not in trainee_set]
     for t in range(n):
         for si, req, sh in [(0, day_d[t], "D"), (1, day_e[t], "E"), (2, day_n[t], "N")]:
             if req == 0:
@@ -1791,15 +1796,16 @@ def generate_schedule(
             if not any(solver.value(b[li][t][si]) for li in leader_indices):
                 anomalies.append(f"⚠ {cycle_dates[t]} {sh}班：無 leader 排班")
 
-    # ── Post-solve 驗證：確認每日人數剛好等於需求
+    # ── Post-solve 驗證：確認每日臨床人數（不含新人）剛好等於需求
     demand_violations: list[str] = []
     for t in range(n):
-        actual_d = sum(solver.value(b[m][t][0]) for m in range(M))
-        actual_e = sum(solver.value(b[m][t][1]) for m in range(M))
-        actual_n = sum(solver.value(b[m][t][2]) for m in range(M))
+        # 排除新人（他們是額外人力，不算入 D/E/N 需求）
+        actual_d = sum(solver.value(b[m][t][0]) for m in range(M) if m not in trainee_set)
+        actual_e = sum(solver.value(b[m][t][1]) for m in range(M) if m not in trainee_set)
+        actual_n = sum(solver.value(b[m][t][2]) for m in range(M) if m not in trainee_set)
         if actual_d != day_d[t] or actual_e != day_e[t] or actual_n != day_n[t]:
             demand_violations.append(
-                f"⚠ {cycle_dates[t]}：D={actual_d}（需{day_d[t]}）E={actual_e}（需{day_e[t]}）N={actual_n}（需{day_n[t]}）"
+                f"⚠ {cycle_dates[t]}：D={actual_d}（需{day_d[t]}）E={actual_e}（需{day_e[t]}）N={actual_n}（需{day_n[t]}）（不含新人）"
             )
     if demand_violations:
         for v in demand_violations:
