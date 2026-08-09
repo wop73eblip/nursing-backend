@@ -777,11 +777,6 @@ def generate_schedule(
     # 內建原則：已填班別（含未確認）一律保留，只填寫空白格子
     overwrite_confirmed = False
 
-    # 權重版本：smooth=順班優先（切換懲罰×倍率）；fair=公平優先（比例/公平懲罰×倍率）
-    # 倍率預設 smooth=2、fair=2；可用 env SMOOTH_SWITCH_MULT / FAIR_DIST_MULT 微調（回測用）
-    SWITCH_MULT = float(os.getenv("SMOOTH_SWITCH_MULT", "2")) if profile == "smooth" else 1.0
-    FAIR_MULT   = float(os.getenv("FAIR_DIST_MULT",   "2")) if profile == "fair"   else 1.0
-
     # 除錯用：DEBUG_SKIP_RULES=rule4,one17,... 可停用特定硬規則群組（生產環境不設定即無作用）
     DEBUG_SKIP = set(filter(None, os.getenv("DEBUG_SKIP_RULES", "").split(",")))
 
@@ -790,6 +785,29 @@ def generate_schedule(
     if not rules_res.data:
         raise HTTPException(400, "請先設定排班規則")
     rules = rules_res.data[0].get("data") or {}
+
+    # ── 懲罰值讀取優先序：rules.penalties (後台 UI) > env (Railway) > hardcoded default
+    _pen_cfg: dict = rules.get("penalties") or {}
+    def pen(key: str, default: int) -> int:
+        v = _pen_cfg.get(key)
+        if v is None:
+            v = os.getenv(key)
+        try:
+            return int(v) if v is not None and str(v).strip() != "" else default
+        except (ValueError, TypeError):
+            return default
+    def pen_float(key: str, default: float) -> float:
+        v = _pen_cfg.get(key)
+        if v is None:
+            v = os.getenv(key)
+        try:
+            return float(v) if v is not None and str(v).strip() != "" else default
+        except (ValueError, TypeError):
+            return default
+
+    # 權重版本：smooth=順班優先（切換懲罰×倍率）；fair=公平優先（比例/公平懲罰×倍率）
+    SWITCH_MULT = pen_float("SMOOTH_SWITCH_MULT", 2.0) if profile == "smooth" else 1.0
+    FAIR_MULT   = pen_float("FAIR_DIST_MULT",   2.0) if profile == "fair"   else 1.0
 
     cycle      = rules.get("cycle", {})
     scheduling = rules.get("scheduling", {})
@@ -877,7 +895,7 @@ def generate_schedule(
             mj = nid.get(nu["mentor_uid"])
             if mj is not None and mj not in trainee_set and mj != i:
                 mentor_of[i] = mj
-    MENTOR_FOLLOW_PENALTY = int(os.getenv("MENTOR_FOLLOW_PENALTY", "5000"))  # 新人每天與導師不同班的軟懲罰（要壓過換班/比例等，才會真的跟著老師；default 拉到 5000 是為了>=EXCESS_SWITCH 常見值）
+    MENTOR_FOLLOW_PENALTY = pen("MENTOR_FOLLOW_PENALTY", 5000)  # 新人每天與導師不同班的軟懲罰
 
     # ── 讀取已確認班 / 指定班（含特休、指定休）
     existing_res = supabase.table("shifts").select("nurse_uid, date, shift, confirmed") \
@@ -999,7 +1017,7 @@ def generate_schedule(
     # 行政班格 (m, t)：這些格視同 D 套用 D 規則，但不佔臨床人力（S1/S11/S12 排除）
     admin_cells: set[tuple[int, int]] = set()
     # 全職每週標準休超過 2 天的懲罰（一例一休真正意思：正常週剛好 2 天、不多給）
-    WEEKLY_OFF_OVER_PENALTY = int(os.getenv("WEEKLY_OFF_OVER_PENALTY", "500"))
+    WEEKLY_OFF_OVER_PENALTY = pen("WEEKLY_OFF_OVER_PENALTY", 500)
 
     for m in range(M):
         nurse = nurses[m]
@@ -1304,7 +1322,7 @@ def generate_schedule(
                 assume_reg.append((_a_s1, f"{_snames_diag[si]}需恰好{req}人（不含行政班）— {cycle_dates[t]}"))
 
     # ── 軟規則：順班目標 + 固定班偏離懲罰 + leader/second 出勤偏好
-    FIX_PENALTY = int(os.getenv("FIX_PENALTY", "500"))
+    FIX_PENALTY = pen("FIX_PENALTY", 500)
     # 固定班最多允許偏離的格數（硬上限），由「允許固定班偏離」規則控制：
     #   勾選(allow_fixed_deviation=True)＝最多偏離 2 格；未勾＝0（固定班完全不可偏離）。
     # fair（公平優先版）一律嚴格 0（固定D只排D）；逃生閥 FAIR_FIX_DEV 可放寬 fair。
@@ -1360,7 +1378,7 @@ def generate_schedule(
             model.add(_min_sk <= sv)
         _sk_spread = model.new_int_var(0, 2, "slack_spread")
         model.add(_sk_spread == _max_sk - _min_sk)
-        _SK_SPREAD_BASE = int(os.getenv("SKILL_SPREAD_PENALTY", "400"))
+        _SK_SPREAD_BASE = pen("SKILL_SPREAD_PENALTY", 400)
         penalties.append(_sk_spread * int(_SK_SPREAD_BASE * FAIR_MULT))
     # leader/second 軟約束懲罰
     for miss_var, pen in leader_miss_vars:
@@ -1374,7 +1392,7 @@ def generate_schedule(
         # 直接懲罰班種之間的差值，不依賴固定工作天數目標
         # 當 off_slack 被啟用時工作天增加，差值約束仍能維持比例平衡
         # 另設硬上限：全職、半職每班種偏差皆 ≤ ±2 天（預填鎖定已超過時自動讓路）
-        DIST_PENALTY = int(int(os.getenv("DIST_PENALTY", "900")) * FAIR_MULT)
+        DIST_PENALTY = int(pen("DIST_PENALTY", 900) * FAIR_MULT)
         _is_ht_m = bool(nurses[m].get("halftime"))
         _cap_days = 2   # 全職、半職皆 ±2（各班種偏離理想 ±2 天）
         _locked_cnt = locked_si_counts_per_m.get(m, [0, 0, 0])
@@ -1417,8 +1435,8 @@ def generate_schedule(
 
         # ── 軟規則：孤立上班日懲罰（OFF-上班-OFF，出來上一天班很累）
         # 半職因工作天少、密度稀,solver 常把他們排成孤立日；用倍率加重讓 solver 優先讓半職連上
-        ISOLATED_WORK_PENALTY = int(os.getenv("ISOLATED_WORK_PENALTY", "750"))
-        _iso_ht_mult = float(os.getenv("HT_ISOLATED_MULT", "2.5"))
+        ISOLATED_WORK_PENALTY = pen("ISOLATED_WORK_PENALTY", 750)
+        _iso_ht_mult = pen_float("HT_ISOLATED_MULT", 2.5)
         _iso_pen_m = int(ISOLATED_WORK_PENALTY * _iso_ht_mult) if is_ht else ISOLATED_WORK_PENALTY
         for t in range(1, n - 1):
             iso = model.new_bool_var(f"isowork_{m}_{t}")
@@ -1452,8 +1470,8 @@ def generate_schedule(
                 continue
             min_sw = num_types - 1               # 必要換班數（2種班=1、DEN=2、固定班=0）
             max_gap = weekly_max_off_total       # Rule7 限制最大連續 OFF
-            E = int(os.getenv("EXCESS_SWITCH_PENALTY", "1500")) * SWITCH_MULT   # 多餘換班扣分（超過必要數的每次）
-            R = int(os.getenv("DIRECT_SWITCH_PENALTY", "500")) * SWITCH_MULT    # 沒休就換加扣（直接切換，必要或多餘皆計）
+            E = int(pen("EXCESS_SWITCH_PENALTY", 1500) * SWITCH_MULT)   # 多餘換班扣分（超過必要數的每次）
+            R = int(pen("DIRECT_SWITCH_PENALTY", 500) * SWITCH_MULT)    # 沒休就換加扣（直接切換，必要或多餘皆計）
 
             all_sw_vars = []      # 每一次換班（含直接與隔OFF）
             direct_sw_vars = []   # 直接沒休就換（g=0）
@@ -1701,8 +1719,8 @@ def generate_schedule(
         print(f"[HINT] warm-start with {_hint_count} cell hints from previous result")
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = float(os.getenv("MAIN_SOLVE_SECONDS", "90"))
-    solver.parameters.num_workers = int(os.getenv("MAIN_SOLVE_WORKERS", "4"))
+    solver.parameters.max_time_in_seconds = pen_float("MAIN_SOLVE_SECONDS", 90)
+    solver.parameters.num_workers = pen("MAIN_SOLVE_WORKERS", 4)
     status = solver.solve(model)
     print(f"[SOLVE] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
 
