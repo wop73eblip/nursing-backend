@@ -1579,6 +1579,87 @@ def generate_schedule(
                 pre_conflicts.append(msg)
                 print(f"[CONFLICT] {msg}")
 
+    # 診斷 4：反向班預填衝突（E→D、N→E、N→D 沒隔開,不管確認或未確認）
+    if no_reverse:
+        # 用 shift 字串比 shift index 更保險（要考慮已鎖 shift 之類）
+        for m in range(M):
+            uid = nurses[m]["uid"]
+            name = nurses[m].get("name") or uid
+            # 取每人的 t → shift 映射（限本次週期天）
+            def _get_shift(_t):
+                if _t < 0 or _t >= n:
+                    return None
+                r = existing.get((uid, cycle_dates[_t]))
+                return (r.get("shift") if r else None) or None
+            for t in range(n - 1):
+                sh_t   = _get_shift(t)
+                sh_t1  = _get_shift(t + 1)
+                if not sh_t or not sh_t1:
+                    continue
+                # E→D、N→E 需隔 1 天休
+                if sh_t == "E" and sh_t1 == "D":
+                    msg = f"【反向班預填】{name} {cycle_dates[t]}(E)→{cycle_dates[t+1]}(D) 之間應隔 1 天 OFF；請把其中一格改為 OFF 或不同班"
+                    pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
+                if sh_t == "N" and sh_t1 == "E":
+                    msg = f"【反向班預填】{name} {cycle_dates[t]}(N)→{cycle_dates[t+1]}(E) 之間應隔 1 天 OFF"
+                    pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
+                # N→D 需隔 2 天 OFF：檢查 t+1 是否 D，或 t+2 是否 D
+                if sh_t == "N":
+                    if sh_t1 == "D":
+                        msg = f"【反向班預填】{name} {cycle_dates[t]}(N)→{cycle_dates[t+1]}(D) 之間應隔 2 天 OFF"
+                        pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
+                    sh_t2 = _get_shift(t + 2)
+                    if sh_t2 == "D":
+                        msg = f"【反向班預填】{name} {cycle_dates[t]}(N)→{cycle_dates[t+2]}(D) 之間應隔 2 天 OFF（目前只隔 1 天）"
+                        pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
+
+    # 診斷 5：連續上班預填超過上限（只掃本次週期內,不含歷史）
+    if max_consec > 0 and "consec_diag" not in DEBUG_SKIP:
+        REST_LIKE = REST_CODES | LEAVE_ADJUST | {"OFF"}
+        for m in range(M):
+            uid = nurses[m]["uid"]
+            name = nurses[m].get("name") or uid
+            run = 0
+            run_start_label = None
+            reported = False
+            for t in range(n):
+                r = existing.get((uid, cycle_dates[t]))
+                sh = (r.get("shift") if r else None)
+                if not sh:
+                    # 未鎖定的格,連續狀態中斷（solver 有彈性可放 OFF）
+                    run = 0; run_start_label = None
+                    continue
+                if sh in REST_LIKE:
+                    run = 0; run_start_label = None
+                else:
+                    if run == 0:
+                        run_start_label = cycle_dates[t]
+                    run += 1
+                    if run > max_consec and not reported:
+                        msg = f"【連續上班超標】{name} 從 {run_start_label} 起已預填 {run} 天連上,超過上限 {max_consec} 天,請在其中插入 OFF"
+                        pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
+                        reported = True
+
+    # 診斷 6：一例一休(勾選時)——某週已鎖上班天數過多,剩不到 2 天可 OFF
+    if one_in_seven:
+        REST_LIKE = REST_CODES | LEAVE_ADJUST | {"OFF"}
+        for m in range(M):
+            if nurses[m].get("halftime"):
+                continue  # 半職不套一例一休
+            uid = nurses[m]["uid"]
+            name = nurses[m].get("name") or uid
+            for wi, (ws, we) in enumerate(weeks):
+                week_len = we - ws + 1
+                work_days = 0
+                for t in range(ws, we + 1):
+                    r = existing.get((uid, cycle_dates[t]))
+                    sh = (r.get("shift") if r else None)
+                    if sh and sh not in REST_LIKE:
+                        work_days += 1
+                if work_days > week_len - 2:
+                    msg = f"【一例一休衝突】{name} 第{wi+1}週({cycle_dates[ws]}~{cycle_dates[we]}) 已預填 {work_days} 天上班,只剩 {week_len - work_days} 天可 OFF,不夠 2 天;請取消一格上班改為 OFF,或關閉「一例一休」硬規則"
+                    pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
+
     # 注意：prefill_conflicts 是警告（已由例外日機制處理），不列入 INFEASIBLE 原因
 
     # 掛上 assumption 開關（全部設為真＝硬規則生效；presolve 會化簡掉，正常求解幾乎無額外開銷）。
@@ -1748,9 +1829,23 @@ def generate_schedule(
         elif violations:
             detail = "⚠ 無法生成符合所有規則的班表。診斷結果：" + "；".join(violations)
         else:
-            detail = "⚠ 無法生成班表。規則條件衝突，建議：① 增加護理師人數 ② 降低每日各班需求人數 ③ 放寬連班/反向班限制"
+            # 找不到明確衝突,提供更具體的檢查方向讓使用者知道從哪裡下手
+            detail = (
+                "⚠ 無法生成班表,但系統無法定位到明確的單一衝突點。可能原因分兩大類:\n\n"
+                "🔴 A. 人力不足(較常見)\n"
+                f"  · 目前臨床人數 {M - len(trainee_set)} 人(不含新人),每日總需求 D+E+N = {sum([daily_d, daily_e, daily_n])} 人\n"
+                "  · 檢查排班規則 tab:各班每日人數是否設太高?一例一休是否勾選(勾選會降低可排天數)?\n"
+                "  · 檢查帳號管理:是否有人被漏勾「輪班屬性」導致某班沒人可排?\n\n"
+                "🟠 B. 預班/已確認資料互相衝突\n"
+                "  · 手動填寫 tab 檢查是否有:E→D 或 N→E/D 反向班沒隔 OFF、某週已鎖 3 種以上班別、某人連續上班超過設定上限\n"
+                "  · 若已確認格子多,先取消確認再生成\n\n"
+                "🟡 C. 其他\n"
+                "  · 固定班偏離設 0(未勾)+ 固定 D 人數不夠當日 D 需求時會失敗\n"
+                "  · 選試 balanced 版本(若失敗於 fair,fair 版對固定班特別嚴)\n"
+                "  · 減少人力變動、縮短週期後重試"
+            )
             if one_in_seven:
-                detail += " ④ 若某週人力吃緊，可取消勾選「一例一休（每週≥2天休）」（現為硬規則）"
+                detail += "\n\n💡 快速解:試著在「排班規則」取消「一例一休」勾選,若能排出代表就是週休 2 天卡住"
         if prefill_conflicts:
             # 這些預班/確認資料與規則不符，在嚴格規則（如公平版固定班）下常是排不出的主因 → 提為「建議優先修正」
             detail += "\n\n⚠ 以下預班／已確認資料與規則不符，嚴格規則下常是排不出的主因，建議先修正：\n" + "\n".join(prefill_conflicts)
