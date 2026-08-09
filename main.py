@@ -504,42 +504,43 @@ def confirm_shifts(
     uid = current_user.get("sub")
     role = current_user.get("role")
 
-    for s in shifts:
-        # 護理師只能確認自己的班
-        if role == "nurse" and s.nurse_uid != uid:
-            raise HTTPException(status_code=403, detail="只能確認自己的班別")
+    if not shifts:
+        return {"message": "已確認 0 筆班別"}
 
-        existing = supabase.table("shifts").select("id").eq("nurse_uid", s.nurse_uid).eq("date", s.date).execute()
-        if existing.data:
-            supabase.table("shifts").update({
-                "shift": s.shift,
-                "confirmed": True,
-                "updated_by": uid,
-                "updated_at": datetime.utcnow().isoformat(),
-            }).eq("nurse_uid", s.nurse_uid).eq("date", s.date).execute()
-        else:
-            supabase.table("shifts").insert({
-                "code": f"{s.nurse_uid}_{s.date}",
-                "label": s.shift or "",
-                "nurse_uid": s.nurse_uid,
-                "date": s.date,
-                "shift": s.shift,
-                "confirmed": True,
-                "updated_by": uid,
-            }).execute()
+    # 護理師只能確認自己的班
+    if role == "nurse":
+        for s in shifts:
+            if s.nurse_uid != uid:
+                raise HTTPException(status_code=403, detail="只能確認自己的班別")
 
-        try:
-            supabase.table("shift_logs").insert({
-                "nurse_uid": s.nurse_uid,
-                "date": s.date,
-                "shift": s.shift,
-                "changed_by": uid,
-                "operator_uid": uid,
-                "operator_role": role,
-                "action": "confirm",
-            }).execute()
-        except Exception:
-            pass
+    now = datetime.utcnow().isoformat()
+    # 一次 upsert 所有 shifts（要求 shifts.code 有 unique constraint）
+    shift_rows = [{
+        "code": f"{s.nurse_uid}_{s.date}",
+        "label": s.shift or "",
+        "nurse_uid": s.nurse_uid,
+        "date": s.date,
+        "shift": s.shift,
+        "confirmed": True,
+        "updated_by": uid,
+        "updated_at": now,
+    } for s in shifts]
+    supabase.table("shifts").upsert(shift_rows, on_conflict="code").execute()
+
+    # 一次 bulk insert 所有 logs（best effort，失敗不影響主流程）
+    try:
+        log_rows = [{
+            "nurse_uid": s.nurse_uid,
+            "date": s.date,
+            "shift": s.shift,
+            "changed_by": uid,
+            "operator_uid": uid,
+            "operator_role": role,
+            "action": "confirm",
+        } for s in shifts]
+        supabase.table("shift_logs").insert(log_rows).execute()
+    except Exception:
+        pass
 
     return {"message": f"已確認 {len(shifts)} 筆班別"}
 
@@ -551,24 +552,38 @@ def unconfirm_shifts(
 ):
     uid = current_user.get("sub")
     role = current_user.get("role")
-    for s in shifts:
-        supabase.table("shifts").update({
-            "confirmed": False,
-            "updated_by": uid,
-            "updated_at": datetime.utcnow().isoformat(),
-        }).eq("nurse_uid", s.nurse_uid).eq("date", s.date).execute()
-        try:
-            supabase.table("shift_logs").insert({
-                "nurse_uid": s.nurse_uid,
-                "date": s.date,
-                "shift": s.shift,
-                "changed_by": uid,
-                "operator_uid": uid,
-                "operator_role": role,
-                "action": "unconfirm",
-            }).execute()
-        except Exception:
-            pass
+    if not shifts:
+        return {"message": "已取消確認 0 筆"}
+
+    now = datetime.utcnow().isoformat()
+    # 一次 upsert 全部（透過 code unique constraint 匹配既有 row 只改 confirmed=False）
+    # shift 值原本不改，這裡 upsert 需要帶完整欄位；shift 傳目前值即可
+    shift_rows = [{
+        "code": f"{s.nurse_uid}_{s.date}",
+        "label": s.shift or "",
+        "nurse_uid": s.nurse_uid,
+        "date": s.date,
+        "shift": s.shift,
+        "confirmed": False,
+        "updated_by": uid,
+        "updated_at": now,
+    } for s in shifts]
+    supabase.table("shifts").upsert(shift_rows, on_conflict="code").execute()
+
+    # bulk log
+    try:
+        log_rows = [{
+            "nurse_uid": s.nurse_uid,
+            "date": s.date,
+            "shift": s.shift,
+            "changed_by": uid,
+            "operator_uid": uid,
+            "operator_role": role,
+            "action": "unconfirm",
+        } for s in shifts]
+        supabase.table("shift_logs").insert(log_rows).execute()
+    except Exception:
+        pass
     return {"message": f"已取消確認 {len(shifts)} 筆"}
 
 
