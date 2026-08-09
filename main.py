@@ -877,7 +877,7 @@ def generate_schedule(
             mj = nid.get(nu["mentor_uid"])
             if mj is not None and mj not in trainee_set and mj != i:
                 mentor_of[i] = mj
-    MENTOR_FOLLOW_PENALTY = int(os.getenv("MENTOR_FOLLOW_PENALTY", "3000"))  # 新人每天與導師不同班的軟懲罰（要壓過換班/比例等，才會真的跟著老師）
+    MENTOR_FOLLOW_PENALTY = int(os.getenv("MENTOR_FOLLOW_PENALTY", "5000"))  # 新人每天與導師不同班的軟懲罰（要壓過換班/比例等，才會真的跟著老師；default 拉到 5000 是為了>=EXCESS_SWITCH 常見值）
 
     # ── 讀取已確認班 / 指定班（含特休、指定休）
     existing_res = supabase.table("shifts").select("nurse_uid, date, shift, confirmed") \
@@ -1334,6 +1334,13 @@ def generate_schedule(
                 assume_reg.append((_a_s12, f"{_snames_diag[si]}至少{target_s}位leader/second（不含行政班）— {cycle_dates[t]}"))
     # ── 新人跟隨導師（軟性）：新人每天盡量與導師同班；新人自己的預班/請假已鎖為硬、
     #    每週剛好2休等規則照常。衝突時求解器彈性偏離幾天（用戶確認做法A：新人自己的休算進其2天週休）。
+    # 診斷：印出 mentor_of 對應（協助 debug「新人沒跟老師」問題）
+    if mentor_of:
+        print(f"[MENTOR] 共 {len(mentor_of)} 對「新人→導師」對應,每天不同班罰 {MENTOR_FOLLOW_PENALTY}:")
+        for _ti, _mj in mentor_of.items():
+            print(f"  {nurses[_ti].get('name','?')} → {nurses[_mj].get('name','?')}")
+    elif trainee_set:
+        print(f"[MENTOR] 共 {len(trainee_set)} 位新人,但無有效導師對應（mentor_uid 可能空或指向行政人員/新人）")
     for _ti, _mj in mentor_of.items():
         for t in range(n):
             _mdiff = model.new_bool_var(f"mentor_diff_{_ti}_{t}")
@@ -1409,13 +1416,16 @@ def generate_schedule(
             pass  # 固定班由 FIX_PENALTY 處理
 
         # ── 軟規則：孤立上班日懲罰（OFF-上班-OFF，出來上一天班很累）
+        # 半職因工作天少、密度稀,solver 常把他們排成孤立日；用倍率加重讓 solver 優先讓半職連上
         ISOLATED_WORK_PENALTY = int(os.getenv("ISOLATED_WORK_PENALTY", "750"))
+        _iso_ht_mult = float(os.getenv("HT_ISOLATED_MULT", "2.5"))
+        _iso_pen_m = int(ISOLATED_WORK_PENALTY * _iso_ht_mult) if is_ht else ISOLATED_WORK_PENALTY
         for t in range(1, n - 1):
             iso = model.new_bool_var(f"isowork_{m}_{t}")
             work_t = sum(b[m][t][s] for s in range(3))
             # iso = 1 若 前一天OFF + 當天上班 + 後一天OFF
             model.add(iso >= b[m][t-1][3] + work_t + b[m][t+1][3] - 2)
-            penalties.append(iso * ISOLATED_WORK_PENALTY)
+            penalties.append(iso * _iso_pen_m)
 
         if fixed_si is not None:
             # 固定班：偏離固定班種每格罰 FIX_PENALTY；並硬性限制偏離格數上限（fair版=0，其他版=2）
@@ -2279,18 +2289,24 @@ def _build_matrix_excel(
         label = ws.cell(row=ri, column=1, value=f"{sname} 資深")
         label.font = bold_font; label.alignment = center; label.border = thin; label.fill = fill_header
         for ci, d_str in enumerate(cycle_dates, 2):
-            cnt = sum(1 for nr in nurse_rows if nr["uid"] in senior_uids and nr["shifts"].get(d_str) == sname)
+            # 新人和行政人員不計入資深臨床帶班統計
+            cnt = sum(1 for nr in nurse_rows
+                      if nr["uid"] in senior_uids
+                      and not nr.get("is_trainee") and not nr.get("admin_staff")
+                      and nr["shifts"].get(d_str) == sname)
             c = ws.cell(row=ri, column=ci, value=cnt)
             c.alignment = center; c.border = thin; c.font = norm_font
             if ci in weekend_cols: c.fill = fill_weekend
         ri += 1
 
-    # ── 底部區塊②：各班總人數（每日，人數不足標黃）
+    # ── 底部區塊②：各班總人數（每日，人數不足標黃；新人和行政人員不計入）
     for si, sname in enumerate(("D", "E", "N")):
         label = ws.cell(row=ri, column=1, value=f"{sname} 總數")
         label.font = bold_font; label.alignment = center; label.border = thin
         for ci, d_str in enumerate(cycle_dates, 2):
-            cnt = sum(1 for nr in nurse_rows if nr["shifts"].get(d_str) == sname)
+            cnt = sum(1 for nr in nurse_rows
+                      if not nr.get("is_trainee") and not nr.get("admin_staff")
+                      and nr["shifts"].get(d_str) == sname)
             cell = ws.cell(row=ri, column=ci, value=cnt)
             cell.alignment = center; cell.border = thin; cell.font = norm_font
             req = demand.get(d_str, (0, 0, 0))[si] if demand else None
@@ -2434,7 +2450,7 @@ def export_temp(
     shift_defs = rules.get("shifts", {})
     rest_codes = {s["code"] for s in shift_defs.get("rest", []) if s.get("code")} or {"OFF", "半"}
 
-    users_res = supabase.table("users").select("uid, name, halftime, level").in_("role", ["nurse", "dual"]).order("sort_order").execute()
+    users_res = supabase.table("users").select("uid, name, halftime, level, is_trainee, admin_staff").in_("role", ["nurse", "dual"]).order("sort_order").execute()
     uid_name   = {u["uid"]: u["name"] for u in (users_res.data or [])}
     uid_halftime = {u["uid"]: u.get("halftime", False) for u in (users_res.data or [])}
 
@@ -2452,18 +2468,23 @@ def export_temp(
             shift = date_shifts.get(d_str, "")
             if not shift:
                 continue
-            # 半職護理師的應休班顯示為「休假」
-            display = "休假" if (uid_halftime.get(uid) and shift in rest_codes and shift != "OFF") else shift
+            # 半職護理師的應休班（含「半」）統一顯示為 OFF
+            display = "OFF" if (uid_halftime.get(uid) and shift in rest_codes) else shift
             shift_map.setdefault(uid, {})[d_str] = display
 
     nurse_rows = [
-        {"uid": u["uid"], "name": u["name"], "level": u.get("level"), "shifts": shift_map.get(u["uid"], {})}
+        {
+            "uid": u["uid"], "name": u["name"], "level": u.get("level"),
+            "is_trainee": u.get("is_trainee", False),
+            "admin_staff": u.get("admin_staff", False),
+            "shifts": shift_map.get(u["uid"], {}),
+        }
         for u in (users_res.data or [])
     ]
 
     demand, special_cols = _compute_demand(rules, body.cycle_dates)
     buf = _build_matrix_excel("暫時班表", body.cycle_dates, nurse_rows, manual_keys,
-                              rest_codes=rest_codes | {"休假"}, demand=demand, special_date_cols=special_cols)
+                              rest_codes=rest_codes, demand=demand, special_date_cols=special_cols)
     filename = f"暫時班表_{start_str}_{end_str}.xlsx"
     return StreamingResponse(
         buf,
