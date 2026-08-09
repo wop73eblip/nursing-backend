@@ -1830,12 +1830,29 @@ def generate_schedule(
             detail = "⚠ 無法生成符合所有規則的班表。診斷結果：" + "；".join(violations)
         else:
             # 找不到明確衝突,提供更具體的檢查方向讓使用者知道從哪裡下手
+            # H7/H8 leader/second 人力狀況（已在上方 diagnostic 準備好 _capable_leaders / _capable_seconds）
+            _sn = ["D班", "E班", "N班"]
+            _reqs = [daily_d, daily_e, daily_n]
+            _ldr_lines = []
+            for si in range(3):
+                if _reqs[si] > 0:
+                    _nl = len(_capable_leaders[si]) if _capable_leaders else 0
+                    _ns = len(_capable_seconds[si]) if _capable_seconds else 0
+                    _mark = ""
+                    if _nl < 1: _mark = " ← H7 缺 leader!"
+                    elif _nl == 1: _mark = " ← 只 1 leader,幾乎不可能每天在班"
+                    elif _ns < 2: _mark = " ← H8 缺 leader+second!"
+                    _ldr_lines.append(f"    {_sn[si]}: leader {_nl} 人 · leader+second {_ns} 人{_mark}")
+            _ldr_block = "\n".join(_ldr_lines) if _ldr_lines else "    (無需求)"
+
             detail = (
-                "⚠ 無法生成班表,但系統無法定位到明確的單一衝突點。可能原因分兩大類:\n\n"
+                "⚠ 無法生成班表,但系統無法定位到明確的單一衝突點。可能原因分三大類:\n\n"
                 "🔴 A. 人力不足(較常見)\n"
-                f"  · 目前臨床人數 {M - len(trainee_set)} 人(不含新人),每日總需求 D+E+N = {sum([daily_d, daily_e, daily_n])} 人\n"
+                f"  · 每班每日人數(S1):臨床 {M - len(trainee_set)} 人(不含新人),每日總需求 D+E+N = {sum([daily_d, daily_e, daily_n])} 人\n"
+                f"  · Leader/資深(H7/H8):每班至少 1 leader、至少 2 leader+second\n"
+                f"{_ldr_block}\n"
                 "  · 檢查排班規則 tab:各班每日人數是否設太高?一例一休是否勾選(勾選會降低可排天數)?\n"
-                "  · 檢查帳號管理:是否有人被漏勾「輪班屬性」導致某班沒人可排?\n\n"
+                "  · 檢查帳號管理:是否有人被漏勾「輪班屬性」導致某班沒人可排?leader/second 職位是否指派夠?\n\n"
                 "🟠 B. 預班/已確認資料互相衝突\n"
                 "  · 手動填寫 tab 檢查是否有:E→D 或 N→E/D 反向班沒隔 OFF、某週已鎖 3 種以上班別、某人連續上班超過設定上限\n"
                 "  · 若已確認格子多,先取消確認再生成\n\n"
