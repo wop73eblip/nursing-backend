@@ -1251,8 +1251,9 @@ def generate_schedule(
         leave_adjust_per_m[m] = leave_adjust_days_m
 
     # ── 硬規則 1：每班每日剛好 req 人；S11/S12（每班至少 1 leader、至少 2 leader/second）為硬規則，人力不足時會 INFEASIBLE
-    leaders = [i for i, n in enumerate(nurses) if n.get("level") == "leader"]
-    seconds = [i for i, n in enumerate(nurses) if n.get("level") in ("leader", "second")]
+    # 新人不算 leader/second 人力（H15）：與下方 S11/S12 constraint 排除新人一致
+    leaders = [i for i, n in enumerate(nurses) if n.get("level") == "leader" and i not in trainee_set]
+    seconds = [i for i, n in enumerate(nurses) if n.get("level") in ("leader", "second") and i not in trainee_set]
 
     SHIFT_ALLOWED_MAP = {
         "固定D": ["D"], "固定E": ["E"], "固定N": ["N"],
@@ -1513,9 +1514,11 @@ def generate_schedule(
                 prefill_conflicts.append(msg)
                 print(f"[CONFLICT] {msg}")
 
-    # 診斷 2：確認班人數 > 當日需求
+    # 診斷 2：確認班人數 > 當日需求（新人不計入臨床人數，故不算入此檢查）
     locked_by_day: dict[int, dict[int, int]] = {}
     for m in range(M):
+        if m in trainee_set:
+            continue
         uid = nurses[m]["uid"]
         for t, d_str in enumerate(cycle_dates):
             key = (uid, d_str)
