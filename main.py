@@ -1091,18 +1091,19 @@ def generate_schedule(
                 locked_si_counts_per_m.setdefault(m, [0, 0, 0])[si] += 1
                 # 檢查是否與輪班屬性衝突（輪班類與固定班都追蹤例外日）
                 fixed_si_check = FIXED_SHIFT_MAP.get(attr)
+                _pf_verb = "已確認" if confirmed else "預填"
                 if fixed_si_check is not None:
                     if si != fixed_si_check:
                         exception_days_m[t] = si
                         prefill_conflicts.append(
-                            f"{nurse_name}（{attr}）{d_str} 預填 {orig_shift}，不符固定班別"
+                            f"【班種衝突】{nurse_name}（{attr}）{d_str} {_pf_verb} {orig_shift} 班"
                         )
                 else:
                     allowed_check = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
                     if shift not in allowed_check:
                         exception_days_m[t] = si
                         prefill_conflicts.append(
-                            f"{nurse_name}（{attr}）{d_str} 預填 {orig_shift}，不在允許班別 {'/'.join(allowed_check)}"
+                            f"【班種衝突】{nurse_name}（{attr}）{d_str} {_pf_verb} {orig_shift} 班"
                         )
 
         # ── 允許班種限制（輪班類硬限制；固定班改用軟懲罰；例外日跳過）
@@ -1131,7 +1132,9 @@ def generate_schedule(
         free_off = [b[m][t][3] for t in range(n) if t not in leave_adjust_days_m]
         # 軟規則 E：人力不足時允許縮減應休天數（off_slack，最多 -2 天）
         off_slack = model.new_int_var(0, 2, f"off_slack_{m}")
-        off_slack_vars.append((m, off_slack))
+        # 半職使用 slack 罰更重(讓 solver 優先填滿半職 quota,而非用 slack)
+        _slack_pen_m = pen("SLACK_PENALTY_HALF", 1000) if is_ht else pen("SLACK_PENALTY_FULL", 200)
+        off_slack_vars.append((m, off_slack, _slack_pen_m))
         if "offdays" not in DEBUG_SKIP:
             model.add(sum(free_off) >= off_days - off_slack)  # 軟下限：最多縮減 2 天
         # 超出應休天數的部分用高懲罰軟約束取代硬上限，避免供需差造成 INFEASIBLE
@@ -1368,14 +1371,14 @@ def generate_schedule(
             model.add(x[_ti][t] == x[_mj][t]).only_enforce_if(_mdiff.negated())
             penalties.append(_mdiff * MENTOR_FOLLOW_PENALTY)
 
-    # off_slack 懲罰（高代價，只在人力不足時才縮減）
-    for _, slack_var in off_slack_vars:
-        penalties.append(slack_var * 200)
+    # off_slack 懲罰(每人不同 penalty:半職 1000、全職 200,讓 solver 更努力給半職滿 OFF)
+    for _, slack_var, _spen in off_slack_vars:
+        penalties.append(slack_var * _spen)
     # 軟規則 E：off_slack 公平分配，懲罰最大與最小差距（避免集中同一人）
     if off_slack_vars:
         _max_sk = model.new_int_var(0, 2, "max_off_slack")
         _min_sk = model.new_int_var(0, 2, "min_off_slack")
-        for _, sv in off_slack_vars:
+        for _, sv, _ in off_slack_vars:
             model.add(_max_sk >= sv)
             model.add(_min_sk <= sv)
         _sk_spread = model.new_int_var(0, 2, "slack_spread")
@@ -1544,29 +1547,7 @@ def generate_schedule(
     # ── 預先衝突診斷（結果回傳給前端）
     pre_conflicts: list[str] = []
 
-    # 診斷 1：確認班 vs 護理師允許班種（已由 exception_days_m 處理，列為警告而非硬錯誤）
-    for m in range(M):
-        uid = nurses[m]["uid"]
-        name = nurses[m].get("name") or uid
-        attr_m = nurses[m].get("attr", "輪班DEN")
-        allowed_m = SHIFT_ALLOWED.get(attr_m, WORK_SHIFTS)
-        allowed_si_m = {SI.get(s) for s in allowed_m} | {3}
-        fixed_si_m = FIXED_SHIFT_MAP.get(attr_m)
-        for t, d_str in enumerate(cycle_dates):
-            key = (uid, d_str)
-            if key not in existing:
-                continue
-            row = existing[key]
-            shift = row.get("shift") or "OFF"
-            if not row.get("confirmed"):
-                continue
-            si = SI.get(shift)
-            if si is None or si == 3:
-                continue
-            if fixed_si_m is None and si not in allowed_si_m:
-                msg = f"【班種衝突】{name}（{attr_m}）{d_str} 已確認 {shift} 班，不在允許班別 {'/'.join(allowed_m)}（已保留，CP-SAT 將於後續導正）"
-                prefill_conflicts.append(msg)
-                print(f"[CONFLICT] {msg}")
+    # 診斷 1(已合併到預填鎖定階段,line ~1094-1106,避免重複訊息;此處保留註解不做事)
 
     # 診斷 2：確認班人數 > 當日需求（新人不計入臨床人數，故不算入此檢查）
     locked_by_day: dict[int, dict[int, int]] = {}
@@ -1937,7 +1918,7 @@ def generate_schedule(
     if rescued_warning:
         warnings.append("⚠ " + rescued_warning)
     reduced_nurses = []
-    for mi, slack_var in off_slack_vars:
+    for mi, slack_var, _ in off_slack_vars:
         v = solver.value(slack_var)
         if v > 0:
             nm = nurses[mi].get("name") or nurses[mi]["uid"]
