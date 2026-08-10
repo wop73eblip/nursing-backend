@@ -1135,9 +1135,11 @@ def generate_schedule(
         if "offdays" not in DEBUG_SKIP:
             model.add(sum(free_off) >= off_days - off_slack)  # 軟下限：最多縮減 2 天
         # 超出應休天數的部分用高懲罰軟約束取代硬上限，避免供需差造成 INFEASIBLE
+        # 全職過休比半職貴 → 讓 solver 優先把多餘 OFF 分給半職(填滿他們 quota),而非全職
         over_off = model.new_int_var(0, n, f"over_off_{m}")
         model.add(sum(free_off) <= off_days + over_off)
-        penalties.append(over_off * 500)  # 強力懲罰超休，盡量不超過應休天數
+        _over_off_pen = pen("OVER_OFF_PENALTY_HALF", 500) if is_ht else pen("OVER_OFF_PENALTY_FULL", 1500)
+        penalties.append(over_off * _over_off_pen)
 
         # ── 硬規則 2：反向班禁止（統一時間軸：history 邊界併入同一組約束，不特判第一天）
         # 允許模式：E, OFF, D  /  N, OFF, E  /  N, OFF, OFF, D
@@ -1383,6 +1385,8 @@ def generate_schedule(
     # leader/second 軟約束懲罰
     for miss_var, pen in leader_miss_vars:
         penalties.append(miss_var * pen)
+    # 收集全體孤立日 bool vars（供 ISOLATED_MAX_TOTAL 硬上限使用）
+    _all_iso_vars: list = []
     for m in range(M):
         attr = nurses[m].get("attr") or "輪班DEN"
         fixed_si = FIXED_SHIFT_MAP.get(attr)
@@ -1444,6 +1448,7 @@ def generate_schedule(
             # iso = 1 若 前一天OFF + 當天上班 + 後一天OFF
             model.add(iso >= b[m][t-1][3] + work_t + b[m][t+1][3] - 2)
             penalties.append(iso * _iso_pen_m)
+            _all_iso_vars.append(iso)
 
         if fixed_si is not None:
             # 固定班：偏離固定班種每格罰 FIX_PENALTY；並硬性限制偏離格數上限（fair版=0，其他版=2）
@@ -1508,6 +1513,12 @@ def generate_schedule(
                 # 沒休就換：每次直接切換另加扣 R（必要或多餘皆計）
                 if direct_sw_vars:
                     penalties.append(sum(direct_sw_vars) * R)
+
+    # ── 孤立日總數硬上限（可選）: ISOLATED_MAX_TOTAL > 0 才啟用
+    _ISO_TOTAL_MAX = pen("ISOLATED_MAX_TOTAL", 0)
+    if _ISO_TOTAL_MAX > 0 and _all_iso_vars:
+        model.add(sum(_all_iso_vars) <= _ISO_TOTAL_MAX)
+        print(f"[ISO_LIMIT] 加硬上限:全體孤立日總數 ≤ {_ISO_TOTAL_MAX}")
 
     model.minimize(sum(penalties))
 
@@ -1696,7 +1707,8 @@ def generate_schedule(
         model.add_assumptions([lit for lit, _ in assume_reg])
 
     # ── 暖啟動：若 body 帶入上次結果，餵給 solver 當 hint（僅提示、不強制；被硬約束反駁時自動忽略）
-    _hint_schedules = (body or {}).get("hint_schedules") or {}
+    # 直接從 Python 呼叫時 body 可能是 FastAPI Body sentinel 物件,不是 dict → 安全判斷
+    _hint_schedules = (body.get("hint_schedules") if isinstance(body, dict) else None) or {}
     if _hint_schedules and "hint" not in DEBUG_SKIP:
         _hint_count = 0
         for _mi, _nu in enumerate(nurses):
@@ -1891,9 +1903,14 @@ def generate_schedule(
             )
             if one_in_seven:
                 detail += "\n\n💡 快速解:試著在「排班規則」取消「一例一休」勾選,若能排出代表就是週休 2 天卡住"
-        if prefill_conflicts:
-            # 這些預班/確認資料與規則不符，在嚴格規則（如公平版固定班）下常是排不出的主因 → 提為「建議優先修正」
+        # prefill_conflicts 只在「真 INFEASIBLE(有 core)」時才列為主因;
+        # timeout(UNKNOWN)時列出容易誤導使用者(這些預班已由例外日機制處理,並非失敗主因)
+        _truly_infeasible = bool(core_labels) or diag_status == cp_model.INFEASIBLE or status == cp_model.INFEASIBLE
+        if prefill_conflicts and _truly_infeasible:
             detail += "\n\n⚠ 以下預班／已確認資料與規則不符，嚴格規則下常是排不出的主因，建議先修正：\n" + "\n".join(prefill_conflicts)
+        elif prefill_conflicts:
+            # timeout 情境:只提示存在但不強調是主因
+            detail += "\n\n💡 提示:以下預班有屬性衝突已由例外日機制處理,不是本次失敗主因;調整可讓班表更整齊:\n" + "\n".join(prefill_conflicts[:3]) + (f"\n(另有 {len(prefill_conflicts)-3} 項)" if len(prefill_conflicts) > 3 else "")
 
         raise HTTPException(400, detail)
 
