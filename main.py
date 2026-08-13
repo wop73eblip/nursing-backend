@@ -1697,6 +1697,43 @@ def generate_schedule(
                     msg = f"【一例一休衝突】{name} 第{wi+1}週({cycle_dates[ws]}~{cycle_dates[we]}) 已預填 {work_days} 天上班,只剩 {week_len - work_days} 天可 OFF,不夠 2 天;請取消一格上班改為 OFF,或關閉「一例一休」硬規則"
                     pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
 
+    # 診斷 7:H16 已鎖狀態下每人是否可能連 2 天 OFF/半(全職硬規則)
+    # 找出被鎖為工作班的天,檢查是否存在任一對 (t, t+1) 兩天都可為 OFF
+    # LEAVE_ADJUST 天不算入配對(與 H16 建模一致)
+    if "two_off" not in DEBUG_SKIP:
+        for m in range(M):
+            if nurses[m].get("halftime"):
+                continue  # 半職除外
+            uid = nurses[m]["uid"]
+            name = nurses[m].get("name") or uid
+            la_days = leave_adjust_per_m.get(m, set())
+            locked_work: set[int] = set()
+            for t, d_str in enumerate(cycle_dates):
+                r = existing.get((uid, d_str))
+                if not r:
+                    continue
+                sh = r.get("shift")
+                if not sh:
+                    continue
+                if r.get("confirmed", False) and overwrite_confirmed:
+                    continue
+                # 行政班(書/會/公)視同工作班;LEAVE_ADJUST 與 REST_CODES 不視為工作
+                if sh in LEAVE_ADJUST or sh in REST_CODES or sh == "OFF":
+                    continue
+                if sh in ADMIN_SHIFTS or sh in SI:
+                    locked_work.add(t)
+            has_pair = False
+            for t in range(n - 1):
+                if t in la_days or (t + 1) in la_days:
+                    continue
+                if t in locked_work or (t + 1) in locked_work:
+                    continue
+                has_pair = True
+                break
+            if not has_pair:
+                msg = f"【連續2天OFF】{name} 已預填/確認狀況下,週期內找不到任何連續 2 天可為 OFF/半 的位置;將違反 H16(全職每週期至少連續 2 天 OFF)"
+                pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
+
     # 注意：prefill_conflicts 是警告（已由例外日機制處理），不列入 INFEASIBLE 原因
 
     # 掛上 assumption 開關（全部設為真＝硬規則生效；presolve 會化簡掉，正常求解幾乎無額外開銷）。
