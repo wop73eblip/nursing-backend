@@ -1255,6 +1255,24 @@ def generate_schedule(
 
         # ── 一例一休（S3）：硬規則（上方 rest 區塊 week_rest_sum >= 2），此處不重複強制
 
+        # ── 硬規則:全職每週期至少一次「連續 2 天 OFF」(不跨週,半職除外)
+        # 定義 A:嚴格 OFF/半 (b[t][3]=1),LEAVE_ADJUST 天不算入配對
+        if not is_ht and "two_off" not in DEBUG_SKIP:
+            _2off_pair_vars = []
+            for ws, we in weeks:
+                for t in range(ws, we):   # t+1 <= we,不跨週
+                    if t in leave_adjust_days_m or (t + 1) in leave_adjust_days_m:
+                        continue   # 含 LEAVE_ADJUST 天不算配對
+                    iso2 = model.new_bool_var(f"twooff_{m}_{t}")
+                    model.add(iso2 <= b[m][t][3])
+                    model.add(iso2 <= b[m][t + 1][3])
+                    model.add(iso2 >= b[m][t][3] + b[m][t + 1][3] - 1)
+                    _2off_pair_vars.append(iso2)
+            if _2off_pair_vars:
+                _a_2off = model.new_bool_var(f"a_2off_{m}")
+                model.add(sum(_2off_pair_vars) >= 1).only_enforce_if(_a_2off)
+                assume_reg.append((_a_2off, f"每週期至少一次連續 2 天 OFF(不跨週) — {nurse_name}"))
+
         # ── 首個週末不同時休：此規則已改為「護理師預班階段硬擋」（前端 NursePage 處理），
         #    自動排班不再受此約束（自動排班若給首週末雙休沒有問題）。
 
