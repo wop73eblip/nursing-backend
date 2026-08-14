@@ -1432,7 +1432,13 @@ def generate_schedule(
         _total_nv = sum(b[m][t][2] for t in range(n))
         _uid_m = nurses[m]["uid"]
         _ov_m  = ratio_overrides.get(_uid_m, {})
-        def _r(key): return max(1, int(_ov_m.get(key, ratio.get(key, 1))))
+        # ratio 用 attr-specific key(de_d/dn_n/den_e...),ratio_overrides 用 generic key(D/E/N)
+        # 舊版 bug:_r("D") 只讀 ratio.get("D") 拿不到 dn_d 等 → 所有比例退化為 1:1(嚴重)
+        def _r(attr_key: str, generic_key: str) -> int:
+            v = _ov_m.get(generic_key)          # 1. 個人覆蓋(generic key,同前端 UI)
+            if v is None:
+                v = ratio.get(attr_key)         # 2. 全體 ratio(attr-specific key)
+            return max(1, int(v) if v is not None else 1)
 
         def _add_pair_penalty(va, ra, vb, rb, label, locked_a=0, locked_b=0):
             """懲罰 |va*rb - vb*ra|，tol = ra+rb-1（1:1 時 tol=1）；
@@ -1453,14 +1459,22 @@ def generate_schedule(
             model.add(diff >= -hard_cap)
 
         if attr == "輪班DE":
-            _add_pair_penalty(_total_d, _r("D"), _total_e, _r("E"), f"de_{m}", _locked_cnt[0], _locked_cnt[1])
+            _rd, _re = _r("de_d","D"), _r("de_e","E")
+            print(f"[RATIO] {nurse_name} attr={attr} D:E = {_rd}:{_re}")
+            _add_pair_penalty(_total_d, _rd, _total_e, _re, f"de_{m}", _locked_cnt[0], _locked_cnt[1])
         elif attr == "輪班DN":
-            _add_pair_penalty(_total_d, _r("D"), _total_nv, _r("N"), f"dn_{m}", _locked_cnt[0], _locked_cnt[2])
+            _rd, _rn = _r("dn_d","D"), _r("dn_n","N")
+            print(f"[RATIO] {nurse_name} attr={attr} D:N = {_rd}:{_rn}")
+            _add_pair_penalty(_total_d, _rd, _total_nv, _rn, f"dn_{m}", _locked_cnt[0], _locked_cnt[2])
         elif attr == "輪班EN":
-            _add_pair_penalty(_total_e, _r("E"), _total_nv, _r("N"), f"en_{m}", _locked_cnt[1], _locked_cnt[2])
+            _re, _rn = _r("en_e","E"), _r("en_n","N")
+            print(f"[RATIO] {nurse_name} attr={attr} E:N = {_re}:{_rn}")
+            _add_pair_penalty(_total_e, _re, _total_nv, _rn, f"en_{m}", _locked_cnt[1], _locked_cnt[2])
         elif attr == "輪班DEN":
-            _add_pair_penalty(_total_d, _r("D"), _total_e, _r("E"), f"de_{m}", _locked_cnt[0], _locked_cnt[1])
-            _add_pair_penalty(_total_d, _r("D"), _total_nv, _r("N"), f"dn_{m}", _locked_cnt[0], _locked_cnt[2])
+            _rd, _re, _rn = _r("den_d","D"), _r("den_e","E"), _r("den_n","N")
+            print(f"[RATIO] {nurse_name} attr={attr} D:E:N = {_rd}:{_re}:{_rn}")
+            _add_pair_penalty(_total_d, _rd, _total_e, _re, f"de_{m}", _locked_cnt[0], _locked_cnt[1])
+            _add_pair_penalty(_total_d, _rd, _total_nv, _rn, f"dn_{m}", _locked_cnt[0], _locked_cnt[2])
         else:
             pass  # 固定班由 FIX_PENALTY 處理
 
