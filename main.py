@@ -2262,6 +2262,8 @@ def generate_schedule(
             "isolated_days": metric_isolated,
             "max_ratio_dev": metric_max_dev,
             "objective_value": (solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None),
+            "best_bound": (solver.best_objective_bound if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None),
+            "solver_status": solver.status_name(status),
             "solver_wall_time": round(solver.wall_time, 2),
         },
     }
