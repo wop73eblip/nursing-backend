@@ -1908,14 +1908,78 @@ def generate_schedule(
     status = solver.solve(model)
     print(f"[SOLVE] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
     # 印 objective 值 + best_bound + gap(供 debug:gap 大 = 還有改善空間,gap 小 = 接近 OPTIMAL)
+    _main_obj = None
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         try:
             _obj = solver.objective_value
             _bound = solver.best_objective_bound
-            _gap_str = f"{((_obj - _bound) / abs(_obj) * 100):.1f}%" if _obj != 0 else "N/A"
+            _gap_pct = abs((_obj - _bound) / _obj * 100) if _obj != 0 else 0
+            _gap_str = f"{_gap_pct:.1f}%" if _obj != 0 else "N/A"
             print(f"[SOLVE] objective={_obj:.0f}  best_bound={_bound:.0f}  gap={_gap_str}")
+            _main_obj = _obj
         except Exception as _e:
             print(f"[SOLVE] objective log failed: {_e}")
+
+    # ── 局部 re-solve:gap > 20% 時挑分數最高的護理師,固定其他人,再 solve
+    # 目的:突破 local minima。目標函式 20+ 項太複雜 solver 卡住,縮小問題空間讓 solver focus
+    _local_enabled = pen("LOCAL_RESOLVE_ENABLED", 1)
+    _local_seconds = pen("LOCAL_RESOLVE_SECONDS", 60)
+    _local_hotspots = pen("LOCAL_RESOLVE_HOTSPOTS", 3)
+    _local_min_gap = pen("LOCAL_RESOLVE_MIN_GAP", 20)  # gap % 閾值
+    if _local_enabled > 0 and _main_obj is not None and status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        try:
+            _cur_gap = abs((_main_obj - solver.best_objective_bound) / _main_obj * 100) if _main_obj != 0 else 0
+        except Exception:
+            _cur_gap = 0
+        if _cur_gap > _local_min_gap:
+            print(f"[LOCAL-RESOLVE] gap={_cur_gap:.1f}% > {_local_min_gap}%,啟動局部 re-solve")
+            # 1. 提取當前解
+            _cur_sol: dict = {}
+            for _m in range(M):
+                for _t in range(n):
+                    _cur_sol[(_m, _t)] = solver.value(x[_m][_t])
+            # 2. 挑熱點:估算每人「段數+短塊」懲罰,半職除外
+            _nurse_scores = []
+            for _m in range(M):
+                if nurses[_m].get("halftime"):
+                    continue
+                _score = 0
+                _work_seq = [_cur_sol[(_m, _t)] for _t in range(n) if _cur_sol[(_m, _t)] < 3]
+                for _s in (0, 1, 2):
+                    _segs = 0; _prev = None
+                    for _v in _work_seq:
+                        if _v == _s and _prev != _s:
+                            _segs += 1
+                        _prev = _v
+                    if _segs > 1:
+                        _score += (_segs - 1) * 3000
+                # 短塊(1 天孤立)
+                for _t in range(1, n - 1):
+                    if _cur_sol[(_m, _t)] < 3 and _cur_sol[(_m, _t-1)] == 3 and _cur_sol[(_m, _t+1)] == 3:
+                        _score += 4000
+                _nurse_scores.append((_score, _m))
+            _nurse_scores.sort(reverse=True)
+            _hotspots = set(_m for _sc, _m in _nurse_scores[:_local_hotspots] if _sc > 0)
+            _hs_names = [nurses[_m].get('name', '?') for _m in _hotspots]
+            print(f"[LOCAL-RESOLVE] hotspots={_hs_names}")
+            if _hotspots:
+                # 3. 固定非熱點所有 cell(add == cur_sol,原可行解仍滿足)
+                for _m in range(M):
+                    if _m in _hotspots:
+                        continue
+                    for _t in range(n):
+                        model.add(x[_m][_t] == _cur_sol[(_m, _t)])
+                # 4. re-solve
+                solver.parameters.max_time_in_seconds = _local_seconds
+                _new_status = solver.solve(model)
+                print(f"[LOCAL-RESOLVE] status={solver.status_name(_new_status)}  wall_time={solver.wall_time:.1f}s")
+                if _new_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    _new_obj = solver.objective_value
+                    _new_bound = solver.best_objective_bound
+                    _new_gap = abs((_new_obj - _new_bound) / _new_obj * 100) if _new_obj != 0 else 0
+                    _improve = (_main_obj - _new_obj) / abs(_main_obj) * 100 if _main_obj != 0 else 0
+                    print(f"[LOCAL-RESOLVE] objective {_main_obj:.0f} → {_new_obj:.0f}  (改善 {_improve:.1f}%,新 gap {_new_gap:.1f}%)")
+                    status = _new_status
 
     # ── 主解失敗（UNKNOWN 逾時 或 INFEASIBLE）：跑一次「純可行性」診斷解。
     #    移除目標函數（最佳化才是主要負擔）＋較短時限，讓求解器能真正判定可行性：
