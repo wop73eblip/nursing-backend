@@ -1901,8 +1901,21 @@ def generate_schedule(
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = pen_float("MAIN_SOLVE_SECONDS", 90)
     solver.parameters.num_workers = pen("MAIN_SOLVE_WORKERS", 4)
+    # LNS 優化:目標函式複雜(塊狀/段數/順班/新人等 20+ 項),solver 易卡 local minima
+    # repair_hint 讓 warm-start 更積極修補;linearization_level=2 更狠 linearize 讓 LNS 更有效
+    solver.parameters.repair_hint = True
+    solver.parameters.linearization_level = 2
     status = solver.solve(model)
     print(f"[SOLVE] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
+    # 印 objective 值 + best_bound + gap(供 debug:gap 大 = 還有改善空間,gap 小 = 接近 OPTIMAL)
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        try:
+            _obj = solver.objective_value
+            _bound = solver.best_objective_bound
+            _gap_str = f"{((_obj - _bound) / abs(_obj) * 100):.1f}%" if _obj != 0 else "N/A"
+            print(f"[SOLVE] objective={_obj:.0f}  best_bound={_bound:.0f}  gap={_gap_str}")
+        except Exception as _e:
+            print(f"[SOLVE] objective log failed: {_e}")
 
     # ── 主解失敗（UNKNOWN 逾時 或 INFEASIBLE）：跑一次「純可行性」診斷解。
     #    移除目標函數（最佳化才是主要負擔）＋較短時限，讓求解器能真正判定可行性：
