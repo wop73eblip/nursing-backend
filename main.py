@@ -1271,6 +1271,13 @@ def generate_schedule(
                 _a_2off = model.new_bool_var(f"a_2off_{m}")
                 model.add(sum(_2off_pair_vars) >= 1).only_enforce_if(_a_2off)
                 assume_reg.append((_a_2off, f"每週期至少一次連續 2 天 OFF — {nurse_name}"))
+                # 額外獎勵:每多一次連續 2 天 OFF 獎勵 -TWO_OFF_EXTRA_REWARD
+                # (重疊計:OFF-OFF-OFF 算 2 對,鼓勵 OFF 塊狀化)
+                _extra_2off_reward = pen("TWO_OFF_EXTRA_REWARD", 500)
+                if _extra_2off_reward > 0:
+                    _extra_2off = model.new_int_var(0, len(_2off_pair_vars), f"extra_2off_{m}")
+                    model.add(_extra_2off >= sum(_2off_pair_vars) - 1)
+                    penalties.append(_extra_2off * (-_extra_2off_reward))
 
         # ── 首個週末不同時休：此規則已改為「護理師預班階段硬擋」（前端 NursePage 處理），
         #    自動排班不再受此約束（自動排班若給首週末雙休沒有問題）。
@@ -1462,6 +1469,7 @@ def generate_schedule(
         ISOLATED_WORK_PENALTY = pen("ISOLATED_WORK_PENALTY", 750)
         _iso_ht_mult = pen_float("HT_ISOLATED_MULT", 2.5)
         _iso_pen_m = int(ISOLATED_WORK_PENALTY * _iso_ht_mult) if is_ht else ISOLATED_WORK_PENALTY
+        _iso_vars_m: list = []
         for t in range(1, n - 1):
             iso = model.new_bool_var(f"isowork_{m}_{t}")
             work_t = sum(b[m][t][s] for s in range(3))
@@ -1469,6 +1477,76 @@ def generate_schedule(
             model.add(iso >= b[m][t-1][3] + work_t + b[m][t+1][3] - 2)
             penalties.append(iso * _iso_pen_m)
             _all_iso_vars.append(iso)
+            _iso_vars_m.append(iso)
+        # 每人孤立日硬上限(H17 default=1),半職除外(密度稀)
+        _iso_per_cap = pen("ISO_MAX_PER_NURSE", 1)
+        if _iso_per_cap > 0 and _iso_vars_m and not is_ht:
+            _a_iso_m = model.new_bool_var(f"a_iso_per_{m}")
+            model.add(sum(_iso_vars_m) <= _iso_per_cap).only_enforce_if(_a_iso_m)
+            assume_reg.append((_a_iso_m, f"每人孤立日 ≤ {_iso_per_cap} — {nurse_name}"))
+
+        # 塊狀懲罰/獎勵:短塊(1-2 天)罰、長塊(≥5 天)罰、中塊(3-4 天)獎勵
+        # 「塊」= 同種上班班連續天數;遇 OFF/半/V/員/喪/延休/補休/調移 就斷開(已 lock 到 si=3)
+        # 半職除外(工作天數少,塊本來就短)
+        _short_pen = pen("SHORT_BLOCK_PENALTY", 2000)
+        _long_pen = pen("LONG_BLOCK_PENALTY", 800)
+        _mid_reward = pen("MID_BLOCK_REWARD", 500)  # 3-4 天塊獎勵(建模時取負)
+        if (_short_pen > 0 or _long_pen > 0 or _mid_reward > 0) and not is_ht:
+            for _s in (0, 1, 2):  # 對 D/E/N 各自算塊
+                for t in range(n):
+                    # 短塊 len=1: b[t][s]=1 且 前/後都不是 s(或邊界)
+                    if _short_pen > 0:
+                        _len1 = model.new_bool_var(f"blk1_{m}_{_s}_{t}")
+                        _terms1 = [b[m][t][_s]]
+                        if t > 0: _terms1.append(1 - b[m][t-1][_s])
+                        if t < n - 1: _terms1.append(1 - b[m][t+1][_s])
+                        model.add(_len1 >= sum(_terms1) - (len(_terms1) - 1))
+                        for _tm in _terms1:
+                            model.add(_len1 <= _tm)
+                        penalties.append(_len1 * _short_pen)
+
+                    # 短塊 len=2: b[t][s]=b[t+1][s]=1 且 前/後都不是 s
+                    if _short_pen > 0 and t <= n - 2:
+                        _len2 = model.new_bool_var(f"blk2_{m}_{_s}_{t}")
+                        _terms2 = [b[m][t][_s], b[m][t+1][_s]]
+                        if t > 0: _terms2.append(1 - b[m][t-1][_s])
+                        if t + 1 < n - 1: _terms2.append(1 - b[m][t+2][_s])
+                        model.add(_len2 >= sum(_terms2) - (len(_terms2) - 1))
+                        for _tm in _terms2:
+                            model.add(_len2 <= _tm)
+                        penalties.append(_len2 * _short_pen)
+
+                    # 中塊 len=3(甜蜜區獎勵):b[t..t+2][s]=1 且 前/後都不是 s
+                    if _mid_reward > 0 and t <= n - 3:
+                        _len3 = model.new_bool_var(f"blk3_{m}_{_s}_{t}")
+                        _terms3 = [b[m][t+k][_s] for k in range(3)]
+                        if t > 0: _terms3.append(1 - b[m][t-1][_s])
+                        if t + 2 < n - 1: _terms3.append(1 - b[m][t+3][_s])
+                        model.add(_len3 >= sum(_terms3) - (len(_terms3) - 1))
+                        for _tm in _terms3:
+                            model.add(_len3 <= _tm)
+                        penalties.append(_len3 * (-_mid_reward))
+
+                    # 中塊 len=4(甜蜜區獎勵):b[t..t+3][s]=1 且 前/後都不是 s
+                    if _mid_reward > 0 and t <= n - 4:
+                        _len4 = model.new_bool_var(f"blk4_{m}_{_s}_{t}")
+                        _terms4 = [b[m][t+k][_s] for k in range(4)]
+                        if t > 0: _terms4.append(1 - b[m][t-1][_s])
+                        if t + 3 < n - 1: _terms4.append(1 - b[m][t+4][_s])
+                        model.add(_len4 >= sum(_terms4) - (len(_terms4) - 1))
+                        for _tm in _terms4:
+                            model.add(_len4 <= _tm)
+                        penalties.append(_len4 * (-_mid_reward))
+
+                    # 長塊 ≥5: b[t..t+4][s]=1 且 t-1 不是 s(僅捕捉 run 起點)
+                    if _long_pen > 0 and t <= n - 5:
+                        _len5 = model.new_bool_var(f"blk5_{m}_{_s}_{t}")
+                        _terms5 = [b[m][t+k][_s] for k in range(5)]
+                        if t > 0: _terms5.append(1 - b[m][t-1][_s])
+                        model.add(_len5 >= sum(_terms5) - (len(_terms5) - 1))
+                        for _tm in _terms5:
+                            model.add(_len5 <= _tm)
+                        penalties.append(_len5 * _long_pen)
 
         if fixed_si is not None:
             # 固定班：偏離固定班種每格罰 FIX_PENALTY；並硬性限制偏離格數上限（fair版=0，其他版=2）
@@ -1533,6 +1611,14 @@ def generate_schedule(
                 # 沒休就換：每次直接切換另加扣 R（必要或多餘皆計）
                 if direct_sw_vars:
                     penalties.append(sum(direct_sw_vars) * R)
+                # [TEST] 每人換班次數硬上限(env SW_MAX_PER_NURSE_DEN / SW_MAX_PER_NURSE_2 啟用)
+                _sw_cap_den = int(os.getenv("SW_MAX_PER_NURSE_DEN", "0") or "0")
+                _sw_cap_2 = int(os.getenv("SW_MAX_PER_NURSE_2", "0") or "0")
+                _sw_cap = _sw_cap_den if num_types >= 3 else _sw_cap_2
+                if _sw_cap > 0:
+                    _a_sw_m = model.new_bool_var(f"a_sw_per_{m}")
+                    model.add(sum(all_sw_vars) <= _sw_cap).only_enforce_if(_a_sw_m)
+                    assume_reg.append((_a_sw_m, f"每人換班次數 ≤ {_sw_cap} — {nurse_name}"))
 
     # ── 孤立日總數硬上限（可選）: ISOLATED_MAX_TOTAL > 0 才啟用
     _ISO_TOTAL_MAX = pen("ISOLATED_MAX_TOTAL", 0)
