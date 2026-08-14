@@ -1495,7 +1495,7 @@ def generate_schedule(
         if (_short_pen > 0 or _long_pen > 0 or _mid_reward > 0) and not is_ht:
             for _s in (0, 1, 2):  # 對 D/E/N 各自算塊
                 for t in range(n):
-                    # 短塊 len=1: b[t][s]=1 且 前/後都不是 s(或邊界)
+                    # 短塊 len=1: b[t][s]=1 且 前/後都不是 s(或邊界);階梯罰 = 懲罰值 × 2
                     if _short_pen > 0:
                         _len1 = model.new_bool_var(f"blk1_{m}_{_s}_{t}")
                         _terms1 = [b[m][t][_s]]
@@ -1504,9 +1504,9 @@ def generate_schedule(
                         model.add(_len1 >= sum(_terms1) - (len(_terms1) - 1))
                         for _tm in _terms1:
                             model.add(_len1 <= _tm)
-                        penalties.append(_len1 * _short_pen)
+                        penalties.append(_len1 * (_short_pen * 2))
 
-                    # 短塊 len=2: b[t][s]=b[t+1][s]=1 且 前/後都不是 s
+                    # 短塊 len=2: b[t][s]=b[t+1][s]=1 且 前/後都不是 s;階梯罰 = 懲罰值 × 1
                     if _short_pen > 0 and t <= n - 2:
                         _len2 = model.new_bool_var(f"blk2_{m}_{_s}_{t}")
                         _terms2 = [b[m][t][_s], b[m][t+1][_s]]
@@ -1617,6 +1617,8 @@ def generate_schedule(
 
             all_sw_vars = []      # 每一次換班（含直接與隔OFF）
             direct_sw_vars = []   # 直接沒休就換（g=0）
+            reverse_sw_vars = []  # 反向班換班：E→D、N→E、N→D（不論隔幾天 OFF/LA）
+            REVERSE_PAIRS = {(1, 0), (2, 1), (2, 0)}  # (s1, s2) SI 對應 D=0/E=1/N=2
             # 班型轉換偵測（統一時間軸：history 併入，不特判第一天）
             for t in range(n):
                 for s2 in range(3):
@@ -1642,6 +1644,8 @@ def generate_schedule(
                             all_sw_vars.append(sw)
                             if g == 0:
                                 direct_sw_vars.append(sw)
+                            if (s1, s2) in REVERSE_PAIRS:
+                                reverse_sw_vars.append(sw)
             if all_sw_vars:
                 # 多餘換班 = max(0, 總換班 − 必要換班數)，每次扣 E
                 excess = model.new_int_var(0, n, f"excess_sw_{m}")
@@ -1650,6 +1654,10 @@ def generate_schedule(
                 # 沒休就換：每次直接切換另加扣 R（必要或多餘皆計）
                 if direct_sw_vars:
                     penalties.append(sum(direct_sw_vars) * R)
+                # 反向班換班額外罰(硬規則已擋未隔 OFF,此為合法反向的軟罰)
+                _rev_pen = pen("REVERSE_SWITCH_PENALTY", 500)
+                if _rev_pen > 0 and reverse_sw_vars:
+                    penalties.append(sum(reverse_sw_vars) * _rev_pen)
                 # [TEST] 每人換班次數硬上限(env SW_MAX_PER_NURSE_DEN / SW_MAX_PER_NURSE_2 啟用)
                 _sw_cap_den = int(os.getenv("SW_MAX_PER_NURSE_DEN", "0") or "0")
                 _sw_cap_2 = int(os.getenv("SW_MAX_PER_NURSE_2", "0") or "0")
