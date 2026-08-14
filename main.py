@@ -1478,12 +1478,13 @@ def generate_schedule(
             penalties.append(iso * _iso_pen_m)
             _all_iso_vars.append(iso)
             _iso_vars_m.append(iso)
-        # 每人孤立日硬上限(H17 default=1),半職除外(密度稀)
-        _iso_per_cap = pen("ISO_MAX_PER_NURSE", 1)
-        if _iso_per_cap > 0 and _iso_vars_m and not is_ht:
+        # 每人孤立日硬上限(H17):全職 default 1,半職 default 2(密度稀,給多 1 個 buffer)
+        _iso_per_cap = pen("ISO_MAX_PER_NURSE_HT", 2) if is_ht else pen("ISO_MAX_PER_NURSE", 1)
+        if _iso_per_cap > 0 and _iso_vars_m:
             _a_iso_m = model.new_bool_var(f"a_iso_per_{m}")
             model.add(sum(_iso_vars_m) <= _iso_per_cap).only_enforce_if(_a_iso_m)
-            assume_reg.append((_a_iso_m, f"每人孤立日 ≤ {_iso_per_cap} — {nurse_name}"))
+            _tag = "半職" if is_ht else "全職"
+            assume_reg.append((_a_iso_m, f"{_tag}孤立日 ≤ {_iso_per_cap} — {nurse_name}"))
 
         # 塊狀懲罰/獎勵:短塊(1-2 天)罰、長塊(≥5 天)罰、中塊(3-4 天)獎勵
         # 「塊」= 同種上班班連續天數;遇 OFF/半/V/員/喪/延休/補休/調移 就斷開(已 lock 到 si=3)
@@ -1547,6 +1548,44 @@ def generate_schedule(
                         for _tm in _terms5:
                             model.add(_len5 <= _tm)
                         penalties.append(_len5 * _long_pen)
+
+        # S11 班種段數集中:每人每種班 s(D/E/N),整週期的「段數」> 1 每多 1 段罰
+        # 「段」定義:只看真正上班的工作日順序(OFF/半/V/員/喪/延休/補休/調移 全部穿透)
+        # 例:D D OFF D D → 1 段 D;D E D → 2 段 D(E 打斷);D V V D → 1 段 D
+        # 用「延續鏈」chain[t] = t 屬於某個 s 段的延續或起點
+        _seg_pen = pen("SEGMENT_PENALTY", 3000)
+        if _seg_pen > 0:
+            for _s in (0, 1, 2):
+                # chain[t] = b[t][s] OR (chain[t-1] AND b[t][3])
+                chain = []
+                for t in range(n):
+                    ch = model.new_bool_var(f"chain_{m}_{_s}_{t}")
+                    if t == 0:
+                        model.add(ch == b[m][0][_s])
+                    else:
+                        cont = model.new_bool_var(f"cont_{m}_{_s}_{t}")
+                        model.add(cont <= chain[t-1])
+                        model.add(cont <= b[m][t][3])
+                        model.add(cont >= chain[t-1] + b[m][t][3] - 1)
+                        model.add(ch >= b[m][t][_s])
+                        model.add(ch >= cont)
+                        model.add(ch <= b[m][t][_s] + cont)
+                    chain.append(ch)
+
+                # seg_start[t] = b[t][s]=1 AND (t=0 OR chain[t-1]=0)
+                seg_start_vars: list = []
+                seg_start_vars.append(b[m][0][_s])  # t=0
+                for t in range(1, n):
+                    st = model.new_bool_var(f"segstart_{m}_{_s}_{t}")
+                    model.add(st <= b[m][t][_s])
+                    model.add(st <= 1 - chain[t-1])
+                    model.add(st >= b[m][t][_s] - chain[t-1])
+                    seg_start_vars.append(st)
+
+                # 段數超過 1 每多罰 SEGMENT_PENALTY
+                _seg_over = model.new_int_var(0, n, f"seg_over_{m}_{_s}")
+                model.add(_seg_over >= sum(seg_start_vars) - 1)
+                penalties.append(_seg_over * _seg_pen)
 
         if fixed_si is not None:
             # 固定班：偏離固定班種每格罰 FIX_PENALTY；並硬性限制偏離格數上限（fair版=0，其他版=2）
