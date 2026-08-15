@@ -2003,7 +2003,22 @@ def generate_schedule(
     rescued_warning = None
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE) and assume_reg:
         try:
-            model.proto.ClearField("objective")
+            # 移除 objective 讓 solver 只做可行性判定;新版 OR-Tools 用 clear_objective(),舊版 model.proto.ClearField
+            _cleared = False
+            try:
+                model.clear_objective()  # OR-Tools ≥ 9.10
+                _cleared = True
+            except AttributeError:
+                pass
+            if not _cleared:
+                try:
+                    model.proto.ClearField("objective")  # 舊版 API
+                    _cleared = True
+                except AttributeError:
+                    pass
+            if not _cleared:
+                # 最終 fallback:重設 minimize 為常數(等效清除)
+                model.minimize(0)
             diag_solver = cp_model.CpSolver()
             diag_solver.parameters.max_time_in_seconds = float(os.getenv("DIAG_SOLVE_SECONDS", "45"))
             diag_solver.parameters.num_workers = 8
