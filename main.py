@@ -1503,9 +1503,10 @@ def generate_schedule(
         # 塊狀懲罰/獎勵:短塊(1-2 天)罰、長塊(≥5 天)罰、中塊(3-4 天)獎勵
         # 「塊」= 同種上班班連續天數;遇 OFF/半/V/員/喪/延休/補休/調移 就斷開(已 lock 到 si=3)
         # 半職除外(工作天數少,塊本來就短)
-        _short_pen = pen("SHORT_BLOCK_PENALTY", 2000)
-        _long_pen = pen("LONG_BLOCK_PENALTY", 800)
-        _mid_reward = pen("MID_BLOCK_REWARD", 500)  # 3-4 天塊獎勵(建模時取負)
+        # smooth 版本把塊狀規則也乘 SWITCH_MULT(順班 = 少換班 + 塊狀 + 段數集中 是同一概念)
+        _short_pen = int(pen("SHORT_BLOCK_PENALTY", 2000) * SWITCH_MULT)
+        _long_pen = int(pen("LONG_BLOCK_PENALTY", 800) * SWITCH_MULT)
+        _mid_reward = int(pen("MID_BLOCK_REWARD", 500) * SWITCH_MULT)  # 3-4 天塊獎勵(建模時取負)
         if (_short_pen > 0 or _long_pen > 0 or _mid_reward > 0) and not is_ht:
             for _s in (0, 1, 2):  # 對 D/E/N 各自算塊
                 for t in range(n):
@@ -1567,7 +1568,7 @@ def generate_schedule(
         # 「段」定義:只看真正上班的工作日順序(OFF/半/V/員/喪/延休/補休/調移 全部穿透)
         # 例:D D OFF D D → 1 段 D;D E D → 2 段 D(E 打斷);D V V D → 1 段 D
         # 用「延續鏈」chain[t] = t 屬於某個 s 段的延續或起點
-        _seg_pen = pen("SEGMENT_PENALTY", 3000)
+        _seg_pen = int(pen("SEGMENT_PENALTY", 3000) * SWITCH_MULT)
         if _seg_pen > 0:
             for _s in (0, 1, 2):
                 # chain[t] = b[t][s] OR (chain[t-1] AND b[t][3])
@@ -1669,7 +1670,7 @@ def generate_schedule(
                 if direct_sw_vars:
                     penalties.append(sum(direct_sw_vars) * R)
                 # 反向班換班額外罰(硬規則已擋未隔 OFF,此為合法反向的軟罰)
-                _rev_pen = pen("REVERSE_SWITCH_PENALTY", 500)
+                _rev_pen = int(pen("REVERSE_SWITCH_PENALTY", 500) * SWITCH_MULT)
                 if _rev_pen > 0 and reverse_sw_vars:
                     penalties.append(sum(reverse_sw_vars) * _rev_pen)
                 # [TEST] 每人換班次數硬上限(env SW_MAX_PER_NURSE_DEN / SW_MAX_PER_NURSE_2 啟用)
