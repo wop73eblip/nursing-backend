@@ -1957,6 +1957,7 @@ def generate_schedule(
     print(f"[SOLVE] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
     # 印 objective 值 + best_bound + gap(供 debug:gap 大 = 還有改善空間,gap 小 = 接近 OPTIMAL)
     _main_obj = None
+    _main_bound = None  # 保留主 solve 的 bound(LOCAL-RESOLVE 之後不能覆蓋,否則 gap 誤導)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         try:
             _obj = solver.objective_value
@@ -1965,6 +1966,7 @@ def generate_schedule(
             _gap_str = f"{_gap_pct:.1f}%" if _obj != 0 else "N/A"
             print(f"[SOLVE] objective={_obj:.0f}  best_bound={_bound:.0f}  gap={_gap_str}")
             _main_obj = _obj
+            _main_bound = _bound
         except Exception as _e:
             print(f"[SOLVE] objective log failed: {_e}")
 
@@ -2513,9 +2515,12 @@ def generate_schedule(
             "isolated_days": metric_isolated,
             "max_ratio_dev": metric_max_dev,
             "person_quality": person_quality,   # {name: score} 只含全職;供前端顯示每人分數
-            "objective_value": (solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None),
-            "best_bound": (solver.best_objective_bound if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None),
+            # 若走 diag 救援(objective 已被清),objective_value = 0 是假的 → 標 None 讓前端顯示「救援解」
+            # 用 solver.objective_value 拿最終解(可能 LOCAL-RESOLVE 更好);bound 用主 solve 保留值(縮小問題的 bound 誤導)
+            "objective_value": (None if rescued_warning else (solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None)),
+            "best_bound": (None if rescued_warning else _main_bound),
             "solver_status": solver.status_name(status),
+            "rescued": bool(rescued_warning),
             "solver_wall_time": round(solver.wall_time, 2),
         },
     }
