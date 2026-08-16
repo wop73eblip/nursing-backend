@@ -759,6 +759,31 @@ def delete_game_message(
     return {"message": "已刪除"}
 
 
+@app.post("/schedule/generate-cg")
+def generate_schedule_cg(
+    profile: str = "balanced",
+    cycle_start: str = "",
+    cycle_days: int = 28,
+    current_user: dict = Depends(require_roles("superadmin")),
+):
+    """[MVP] Column Generation 排班 — 僅 superadmin,不影響現有 CP-SAT 排班
+
+    做法:對每人 DP 產生 15 個「塊狀漂亮」候選,再用 CP-SAT 選一組滿足需求。
+    忽略:leader/second、H4 每週 2 種、F1 首週末、S6 新人跟老師、H17 iso 上限、H16 加碼、H13 硬比例。
+    """
+    import cg_scheduler
+    if not cycle_start:
+        raise HTTPException(400, "缺少 cycle_start(YYYY-MM-DD)")
+    try:
+        result = cg_scheduler.generate_cg_schedule(
+            profile=profile, current_user=current_user, supabase=supabase,
+            cycle_start_str=cycle_start, cycle_days=cycle_days,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(400, f"CG 排班錯誤:{e}")
+
+
 @app.post("/schedule/generate")
 def generate_schedule(
     overwrite_confirmed: bool = False,
