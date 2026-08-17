@@ -759,31 +759,6 @@ def delete_game_message(
     return {"message": "已刪除"}
 
 
-@app.post("/schedule/generate-cg")
-def generate_schedule_cg(
-    profile: str = "balanced",
-    cycle_start: str = "",
-    cycle_days: int = 28,
-    current_user: dict = Depends(require_roles("superadmin")),
-):
-    """[MVP] Column Generation 排班 — 僅 superadmin,不影響現有 CP-SAT 排班
-
-    做法:對每人 DP 產生 15 個「塊狀漂亮」候選,再用 CP-SAT 選一組滿足需求。
-    忽略:leader/second、H4 每週 2 種、F1 首週末、S6 新人跟老師、H17 iso 上限、H16 加碼、H13 硬比例。
-    """
-    import cg_scheduler
-    if not cycle_start:
-        raise HTTPException(400, "缺少 cycle_start(YYYY-MM-DD)")
-    try:
-        result = cg_scheduler.generate_cg_schedule(
-            profile=profile, current_user=current_user, supabase=supabase,
-            cycle_start_str=cycle_start, cycle_days=cycle_days,
-        )
-        return result
-    except Exception as e:
-        raise HTTPException(400, f"CG 排班錯誤:{e}")
-
-
 @app.post("/schedule/generate")
 def generate_schedule(
     overwrite_confirmed: bool = False,
@@ -1439,15 +1414,7 @@ def generate_schedule(
         penalties.append(miss_var * pen)
     # 收集全體孤立日 bool vars（供 ISOLATED_MAX_TOTAL 硬上限使用）
     _all_iso_vars: list = []
-    # [TEST-MINIMAX/TWO-PHASE] 每人 penalty 起點追蹤(需要 pq per m 才啟用)
-    _MINIMAX_ENABLE = os.getenv("MINIMAX_ENABLE", "0") == "1"
-    _TWO_PHASE_ENABLE_EARLY = os.getenv("TWO_PHASE_ENABLE", "0") == "1"
-    _MINIMAX_WEIGHT = int(os.getenv("MINIMAX_WEIGHT", "1000"))
-    _TRACK_PQ = _MINIMAX_ENABLE or _TWO_PHASE_ENABLE_EARLY
-    _starts_per_m: list = []
     for m in range(M):
-        if _TRACK_PQ:
-            _starts_per_m.append(len(penalties))
         attr = nurses[m].get("attr") or "輪班DEN"
         fixed_si = FIXED_SHIFT_MAP.get(attr)
         la_set = leave_adjust_per_m.get(m, set())
@@ -1721,32 +1688,7 @@ def generate_schedule(
         model.add(sum(_all_iso_vars) <= _ISO_TOTAL_MAX)
         print(f"[ISO_LIMIT] 加硬上限:全體孤立日總數 ≤ {_ISO_TOTAL_MAX}")
 
-    # [TEST-MINIMAX] 混合 objective: sum(penalties) + max_pq * WEIGHT
-    # [TEST-TWO-PHASE] 兩階段:階段 1 min max_pq → 階段 2 (add max_pq ≤ X+tol) min sum
-    _TWO_PHASE_ENABLE = os.getenv("TWO_PHASE_ENABLE", "0") == "1"
-    _person_pq_vars = []
-    _max_pq = None
-    if _MINIMAX_ENABLE or _TWO_PHASE_ENABLE:
-        _starts_per_m.append(len(penalties))  # 標記 loop end
-        for _mi in range(M):
-            _pq_terms = penalties[_starts_per_m[_mi]:_starts_per_m[_mi+1]]
-            if _pq_terms:
-                _pq_v = model.new_int_var(-10_000_000, 10_000_000, f"pq_{_mi}")
-                model.add(_pq_v == sum(_pq_terms))
-                _person_pq_vars.append(_pq_v)
-        if _person_pq_vars:
-            _max_pq = model.new_int_var(-10_000_000, 10_000_000, "max_pq")
-            for _pq in _person_pq_vars:
-                model.add(_max_pq >= _pq)
-
-    if _TWO_PHASE_ENABLE and _max_pq is not None:
-        model.minimize(_max_pq)
-        print(f"[TWO-PHASE] 階段 1:min max_pq(tracking {len(_person_pq_vars)} nurses)")
-    elif _MINIMAX_ENABLE and _max_pq is not None:
-        model.minimize(sum(penalties) + _max_pq * _MINIMAX_WEIGHT)
-        print(f"[MINIMAX] enabled, weight={_MINIMAX_WEIGHT}, tracking {len(_person_pq_vars)} nurses")
-    else:
-        model.minimize(sum(penalties))
+    model.minimize(sum(penalties))
 
     # ── 求解前診斷
     print(f"\n[SOLVE] 護理師={M} 週期={n}天 需求D/E/N={daily_d}/{daily_e}/{daily_n}")
@@ -1995,31 +1937,6 @@ def generate_schedule(
         except Exception as _e:
             print(f"[SOLVE] objective log failed: {_e}")
 
-    # [TEST-TWO-PHASE] 階段 2:add max_pq ≤ X + tolerance, min sum(penalties)
-    if _TWO_PHASE_ENABLE and _max_pq is not None and status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        _phase1_max = solver.value(_max_pq)
-        _tol = int(abs(_phase1_max) * float(os.getenv("TWO_PHASE_TOL", "0.1")))
-        print(f"[TWO-PHASE] 階段 1 完成:max_pq={_phase1_max},tolerance={_tol}")
-        model.add(_max_pq <= _phase1_max + _tol)
-        # clear objective 再重設
-        try:
-            model.clear_objective()
-        except AttributeError:
-            try: model.proto.ClearField("objective")
-            except AttributeError: pass
-        model.minimize(sum(penalties))
-        _phase2_sec = int(os.getenv("TWO_PHASE_SEC", "60"))
-        solver.parameters.max_time_in_seconds = _phase2_sec
-        status = solver.solve(model)
-        print(f"[TWO-PHASE] 階段 2 完成:status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            try:
-                _main_obj = solver.objective_value
-                _new_max = solver.value(_max_pq)
-                print(f"[TWO-PHASE] objective={_main_obj:.0f}  max_pq={_new_max}")
-            except Exception:
-                pass
-
     # ── 局部 re-solve:gap > 20% 時挑分數最高的護理師,固定其他人,再 solve
     # 目的:突破 local minima。目標函式 20+ 項太複雜 solver 卡住,縮小問題空間讓 solver focus
     _local_enabled = pen("LOCAL_RESOLVE_ENABLED", 1)
@@ -2038,25 +1955,14 @@ def generate_schedule(
             for _m in range(M):
                 for _t in range(n):
                     _cur_sol[(_m, _t)] = solver.value(x[_m][_t])
-            # 2. 挑熱點:完整 pq 估算(段數+塊狀+換班+iso+反向班),半職除外
-            # 使用 env HOTSPOT_MODE=full 啟用完整 pq 版;default 用原本「段數+短塊」簡版
-            _hotspot_mode = os.getenv("HOTSPOT_MODE", "simple")
+            # 2. 挑熱點:估算每人「段數+短塊」懲罰,半職除外
             _nurse_scores = []
-            _REVERSE = {(1,0),(2,1),(2,0)}
-            _short_pen_c = pen("SHORT_BLOCK_PENALTY", 2000)
-            _mid_rew_c = pen("MID_BLOCK_REWARD", 500)
-            _long_pen_c = pen("LONG_BLOCK_PENALTY", 800)
             _seg_pen_c = pen("SEGMENT_PENALTY", 3000)
-            _iso_pen_c = pen("ISOLATED_WORK_PENALTY", 750)
-            _excess_c = pen("EXCESS_SWITCH_PENALTY", 1500)
-            _direct_c = pen("DIRECT_SWITCH_PENALTY", 500)
-            _rev_c = pen("REVERSE_SWITCH_PENALTY", 500)
             for _m in range(M):
                 if nurses[_m].get("halftime"):
                     continue
                 _score = 0
-                _all_seq = [_cur_sol[(_m, _t)] for _t in range(n)]
-                _work_seq = [v for v in _all_seq if v < 3]
+                _work_seq = [_cur_sol[(_m, _t)] for _t in range(n) if _cur_sol[(_m, _t)] < 3]
                 # 段數
                 for _s in (0, 1, 2):
                     _segs = 0; _prev = None
@@ -2066,39 +1972,10 @@ def generate_schedule(
                         _prev = _v
                     if _segs > 1:
                         _score += (_segs - 1) * _seg_pen_c
-                if _hotspot_mode == "full":
-                    # 塊(1-4 天,5+):OFF 就斷
-                    _blocks = []; _i = 0
-                    while _i < n:
-                        if _all_seq[_i] < 3:
-                            _j = _i
-                            while _j < n and _all_seq[_j] == _all_seq[_i]:
-                                _j += 1
-                            _blocks.append(_j - _i)
-                            _i = _j
-                        else:
-                            _i += 1
-                    for _l in _blocks:
-                        if _l == 1: _score += _short_pen_c * 2
-                        elif _l == 2: _score += _short_pen_c
-                        elif 3 <= _l <= 4: _score -= _mid_rew_c
-                        elif _l >= 5: _score += _long_pen_c
-                    # 孤立日 penalty
-                    for _t in range(1, n - 1):
-                        if _all_seq[_t] < 3 and _all_seq[_t-1] == 3 and _all_seq[_t+1] == 3:
-                            _score += _iso_pen_c
-                    # 換班(相鄰工作日切換,包含直接與反向)
-                    for _t in range(n - 1):
-                        _a, _b = _all_seq[_t], _all_seq[_t+1]
-                        if _a < 3 and _b < 3 and _a != _b:
-                            _score += _excess_c + _direct_c
-                            if (_a, _b) in _REVERSE:
-                                _score += _rev_c
-                else:
-                    # simple: 舊版「段數+短塊」
-                    for _t in range(1, n - 1):
-                        if _cur_sol[(_m, _t)] < 3 and _cur_sol[(_m, _t-1)] == 3 and _cur_sol[(_m, _t+1)] == 3:
-                            _score += 4000
+                # 短塊(1 天孤立)
+                for _t in range(1, n - 1):
+                    if _cur_sol[(_m, _t)] < 3 and _cur_sol[(_m, _t-1)] == 3 and _cur_sol[(_m, _t+1)] == 3:
+                        _score += 4000
                 _nurse_scores.append((_score, _m))
             _nurse_scores.sort(reverse=True)
             _hotspots = set(_m for _sc, _m in _nurse_scores[:_local_hotspots] if _sc > 0)
