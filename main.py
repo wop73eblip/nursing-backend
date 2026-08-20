@@ -1409,9 +1409,9 @@ def generate_schedule(
         model.add(_sk_spread == _max_sk - _min_sk)
         _SK_SPREAD_BASE = pen("SKILL_SPREAD_PENALTY", 400)
         penalties.append(_sk_spread * int(_SK_SPREAD_BASE * FAIR_MULT))
-    # leader/second 軟約束懲罰
-    for miss_var, pen in leader_miss_vars:
-        penalties.append(miss_var * pen)
+    # leader/second 軟約束懲罰(注意:loop 變數不能叫 pen,會 shadow 全域 pen() 函式!)
+    for miss_var, _pen_val in leader_miss_vars:
+        penalties.append(miss_var * _pen_val)
     # 收集全體孤立日 bool vars（供 ISOLATED_MAX_TOTAL 硬上限使用）
     _all_iso_vars: list = []
     for m in range(M):
@@ -1425,7 +1425,7 @@ def generate_schedule(
         # 另設硬上限：全職、半職每班種偏差皆 ≤ ±2 天（預填鎖定已超過時自動讓路）
         DIST_PENALTY = int(pen("DIST_PENALTY", 900) * FAIR_MULT)
         _is_ht_m = bool(nurses[m].get("halftime"))
-        _cap_days = 2   # 全職、半職皆 ±2（各班種偏離理想 ±2 天）
+        _cap_days = pen("RATIO_CAP_DAYS", 2)   # H13 比例硬上限;env 可覆蓋(2 較嚴、4-5 較鬆)
         _locked_cnt = locked_si_counts_per_m.get(m, [0, 0, 0])
         _total_d  = sum(b[m][t][0] for t in range(n))
         _total_e  = sum(b[m][t][1] for t in range(n))
@@ -1941,7 +1941,7 @@ def generate_schedule(
     # 目的:突破 local minima。目標函式 20+ 項太複雜 solver 卡住,縮小問題空間讓 solver focus
     _local_enabled = pen("LOCAL_RESOLVE_ENABLED", 1)
     _local_seconds = pen("LOCAL_RESOLVE_SECONDS", 60)
-    _local_hotspots = pen("LOCAL_RESOLVE_HOTSPOTS", 3)
+    _local_hotspots = pen("LOCAL_RESOLVE_HOTSPOTS", 5)
     _local_min_gap = pen("LOCAL_RESOLVE_MIN_GAP", 20)  # gap % 閾值
     if _local_enabled > 0 and _main_obj is not None and status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         try:
@@ -1988,7 +1988,16 @@ def generate_schedule(
                         continue
                     for _t in range(n):
                         model.add(x[_m][_t] == _cur_sol[(_m, _t)])
-                # 4. re-solve
+                # 4. 快照主 solve 的解(re-solve 若更差,fallback 用這個)
+                _main_snapshot = {(_m, _t): _cur_sol[(_m, _t)] for _m in range(M) for _t in range(n)}
+                # 加 hint 引導 solver 從主解起點微調(避免亂走)
+                try:
+                    for _m in range(M):
+                        for _t in range(n):
+                            model.add_hint(x[_m][_t], _cur_sol[(_m, _t)])
+                except Exception:
+                    pass
+                # 5. re-solve
                 solver.parameters.max_time_in_seconds = _local_seconds
                 _new_status = solver.solve(model)
                 print(f"[LOCAL-RESOLVE] status={solver.status_name(_new_status)}  wall_time={solver.wall_time:.1f}s")
@@ -1997,8 +2006,18 @@ def generate_schedule(
                     _new_bound = solver.best_objective_bound
                     _new_gap = abs((_new_obj - _new_bound) / _new_obj * 100) if _new_obj != 0 else 0
                     _improve = (_main_obj - _new_obj) / abs(_main_obj) * 100 if _main_obj != 0 else 0
-                    print(f"[LOCAL-RESOLVE] objective {_main_obj:.0f} → {_new_obj:.0f}  (改善 {_improve:.1f}%,新 gap {_new_gap:.1f}%)")
-                    status = _new_status
+                    # 只在真的改善才 accept re-solve;否則保留主解(避免 re-solve 給更差)
+                    if _new_obj < _main_obj:
+                        print(f"[LOCAL-RESOLVE] objective {_main_obj:.0f} → {_new_obj:.0f}  (改善 {_improve:.1f}%,新 gap {_new_gap:.1f}%) ACCEPTED")
+                        status = _new_status
+                    else:
+                        print(f"[LOCAL-RESOLVE] objective {_main_obj:.0f} → {_new_obj:.0f}  (未改善,fallback 到主解 snapshot)")
+                        # 重加 hard constraint 鎖住 snapshot(讓後續 solver.value() 讀到主解值)
+                        for (_m, _t), _v in _main_snapshot.items():
+                            try: model.add(x[_m][_t] == _v)
+                            except Exception: pass
+                        solver.solve(model)
+                        status = cp_model.OPTIMAL
 
     # ── 主解失敗（UNKNOWN 逾時 或 INFEASIBLE）：跑一次「純可行性」診斷解。
     #    移除目標函數（最佳化才是主要負擔）＋較短時限，讓求解器能真正判定可行性：
@@ -2307,14 +2326,16 @@ def generate_schedule(
     _halftime_of = {nz["uid"]: nz.get("halftime", False) for nz in nurses}
     _name_of = {nz["uid"]: nz.get("name") or nz["uid"] for nz in nurses}
     # 每人 pq(person_quality)= 該人所有軟 penalty 加總,只計全職
+    # 對齊 solver:除 ISO 外全部乘 SWITCH_MULT(smooth 版加乘)
     _pq_pens = {
-        "SEG": pen("SEGMENT_PENALTY", 3000),
-        "SHORT": pen("SHORT_BLOCK_PENALTY", 2000),
-        "MID": pen("MID_BLOCK_REWARD", 500),
-        "LONG": pen("LONG_BLOCK_PENALTY", 800),
-        "ISO": pen("ISOLATED_WORK_PENALTY", 750),
-        "EXCESS": pen("EXCESS_SWITCH_PENALTY", 1500),
-        "REV": pen("REVERSE_SWITCH_PENALTY", 500),
+        "SEG": int(pen("SEGMENT_PENALTY", 3000) * SWITCH_MULT),
+        "SHORT": int(pen("SHORT_BLOCK_PENALTY", 2000) * SWITCH_MULT),
+        "MID": int(pen("MID_BLOCK_REWARD", 500) * SWITCH_MULT),
+        "LONG": int(pen("LONG_BLOCK_PENALTY", 800) * SWITCH_MULT),
+        "ISO": pen("ISOLATED_WORK_PENALTY", 750),   # solver 沒乘 SWITCH_MULT
+        "EXCESS": int(pen("EXCESS_SWITCH_PENALTY", 1500) * SWITCH_MULT),
+        "DIRECT": int(pen("DIRECT_SWITCH_PENALTY", 500) * SWITCH_MULT),
+        "REV": int(pen("REVERSE_SWITCH_PENALTY", 500) * SWITCH_MULT),
     }
     person_quality: dict = {}
     metric_switches = 0   # 總換班（保留供參考）
@@ -2367,11 +2388,20 @@ def generate_schedule(
                     _sw_cnt += 1
                     if (work_seq[_k-1], work_seq[_k]) in _REV:
                         _rev_cnt += 1
+            # DIRECT switch:相鄰工作日切換,無 OFF 隔(對齊 solver R 邏輯)
+            _direct_cnt = 0
+            for _i in range(len(_seq) - 1):
+                if _seq[_i] != 'X' and _seq[_i+1] != 'X' and _seq[_i] != _seq[_i+1]:
+                    _direct_cnt += 1
+            # EXCESS 扣掉必要換班數(對齊 solver excess = max(0, sw - min_sw))
+            _min_sw = max(0, _ntypes - 1)
+            _excess_sw = max(0, _sw_cnt - _min_sw)
             _pq = (_seg_over * _pq_pens['SEG']
                    + _l1 * _pq_pens['SHORT'] * 2 + _l2 * _pq_pens['SHORT']
                    - _l34 * _pq_pens['MID'] + _l5 * _pq_pens['LONG']
                    + _iso_cnt * _pq_pens['ISO']
-                   + _sw_cnt * _pq_pens['EXCESS']
+                   + _excess_sw * _pq_pens['EXCESS']
+                   + _direct_cnt * _pq_pens['DIRECT']
                    + _rev_cnt * _pq_pens['REV'])
             person_quality[_name_of.get(uid, uid)] = _pq
     for m2, nurse2 in enumerate(nurses):
