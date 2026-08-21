@@ -1913,21 +1913,34 @@ def generate_schedule(
                 _hint_count += 1
         print(f"[HINT] warm-start with {_hint_count} cell hints from previous result")
 
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = pen_float("MAIN_SOLVE_SECONDS", 90)
-    solver.parameters.num_workers = pen("MAIN_SOLVE_WORKERS", 4)
-    solver.parameters.repair_hint = True
-    solver.parameters.linearization_level = 2
+    def _build_solver(seed=None):
+        _s = cp_model.CpSolver()
+        _s.parameters.max_time_in_seconds = pen_float("MAIN_SOLVE_SECONDS", 90)
+        _s.parameters.num_workers = pen("MAIN_SOLVE_WORKERS", 4)
+        _s.parameters.repair_hint = True
+        _s.parameters.linearization_level = 2
+        if seed is not None:
+            _s.parameters.random_seed = seed
+        return _s
+
     # seed 選擇:env CP_SAT_SEED > 0 用該值;否則 balanced 用 42(實測 obj -10.2%),其他 profile 用 default
     _cp_seed = int(os.getenv("CP_SAT_SEED", "0") or "0")
     if _cp_seed > 0:
-        solver.parameters.random_seed = _cp_seed
+        solver = _build_solver(seed=_cp_seed)
         print(f"[SOLVE] using seed={_cp_seed} (from env)")
     elif profile == "balanced":
-        solver.parameters.random_seed = 42
+        solver = _build_solver(seed=42)
         print(f"[SOLVE] using seed=42 (balanced profile,實測改善 -10.2%)")
+    else:
+        solver = _build_solver()
     status = solver.solve(model)
     print(f"[SOLVE] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
+    # Fallback:balanced 若 seed=42 卡住 UNKNOWN,退回 default seed 再試一次
+    if profile == "balanced" and _cp_seed == 0 and status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print(f"[SOLVE FALLBACK] seed=42 卡住(status={solver.status_name(status)}),退回 default seed 再試")
+        solver = _build_solver()
+        status = solver.solve(model)
+        print(f"[SOLVE FALLBACK] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
     _main_obj = None
     _main_bound = None
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
