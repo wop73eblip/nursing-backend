@@ -1,0 +1,36 @@
+name: Deploy Backend
+
+# push 到 main 自動 deploy 到 Railway
+# 忽略只改 test/README/keepalive 的情況
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'tests/**'
+      - '**.md'
+      - '.gitignore'
+      - '.github/workflows/keepalive.yml'
+      - '.github/workflows/deploy.yml'   # 改 workflow 本身不觸發自身
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-backend
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --service ${{ secrets.RAILWAY_SERVICE_ID }} --detach
+
+      - name: Report success
+        run: echo "✅ Backend deploy triggered. Check https://web-production-e9f2a5.up.railway.app"

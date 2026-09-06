@@ -1,0 +1,59 @@
+name: Backend Tests
+
+# push 或 PR 時跑 pytest,擋 bug 進 main
+# 只跑 test 相關 code 或核心 module 改動時觸發
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.py'
+      - 'requirements.txt'
+      - 'tests/**'
+      - '.github/workflows/test.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest requests pyjwt
+
+      - name: Start backend in background
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
+          SA_SECONDS: "3"
+        run: |
+          python -m uvicorn main:app --host 127.0.0.1 --port 8877 --log-level warning &
+          # 等 backend ready
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:8877/ | grep -q "運行中"; then break; fi
+            sleep 2
+          done
+          curl -s http://127.0.0.1:8877/ | head -1
+
+      - name: Run pytest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          TEST_SECRET_KEY: ${{ secrets.SECRET_KEY }}
+        run: pytest tests/ -v --tb=short
