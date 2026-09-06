@@ -763,7 +763,9 @@ def delete_game_message(
 def generate_schedule(
     overwrite_confirmed: bool = False,
     profile: str = "balanced",   # smooth=順班優先 / fair=公平優先 / balanced=預設
-    body: dict = Body(default={}),   # 可選 body：{"hint_schedules": {uid: {date: shift}}} 供暖啟動
+    seed: int = 0,                # 前端指定 seed(0=用預設);balanced 會自動 fallback 到下一個 seed
+    random_search: int = 0,       # 1=啟用 CP-SAT 隨機探索(randomize_search),適合 seed 都卡住時
+    body: dict = Body(default={}),   # 可選 body:{"hint_schedules": {uid: {date: shift}}} 供暖啟動
     current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
 ):
     """
@@ -814,6 +816,9 @@ def generate_schedule(
     ratio      = rules.get("ratio", {})
     ratio_overrides_list = rules.get("ratio_overrides", [])
     ratio_overrides = {o["nurse_uid"]: o["ratio"] for o in ratio_overrides_list}
+    # 個別護理師 attr 偏離配額(允許排非 attr 班別幾天):[{nurse_uid, days}]
+    _nurse_dev_list = rules.get("nurse_deviation_overrides", []) or []
+    _nurse_dev_overrides = {o["nurse_uid"]: int(o.get("days") or 0) for o in _nurse_dev_list if o.get("nurse_uid")}
 
     start_str = cycle.get("start_date")
     end_str   = cycle.get("end_date")
@@ -850,7 +855,6 @@ def generate_schedule(
     restrict_first_weekend = bool(scheduling.get("restrict_first_weekend", True))
     one_in_seven = bool(scheduling.get("one_in_seven", True))   # 一例一休
     lock_first_day       = bool(scheduling.get("lock_first_day", True))
-    lock_designated_off  = bool(scheduling.get("lock_designated_off", True))
     weekly_max_off_auto  = int(scheduling.get("weekly_max_off_auto", 2))   # 自動休連續天數上限
     weekly_max_off_total = int(scheduling.get("weekly_max_off_total", 3))  # 每週應休總上限
     holiday_days = int(cycle.get("holiday_days", 0))
@@ -991,7 +995,8 @@ def generate_schedule(
     model = cp_model.CpModel()
     leave_adjust_per_m: dict[int, set[int]] = {}  # 各護理師的 LEAVE_ADJUST 天索引
     locked_si_counts_per_m: dict[int, list[int]] = {}  # 各護理師已鎖定工作班數量 [D,E,N]（供比例硬上限讓路）
-    off_slack_vars: list[tuple[int, any]] = []     # (m, slack_var) for shortage warning
+    off_slack_vars: list[tuple[int, any]] = []     # (m, slack_var, pen) for shortage warning
+    over_off_vars: list = []                        # (m, over_off_var) for H18 應休優先
 
     # x[m][t] ∈ {0,1,2,3} → D/E/N/OFF
     x: list[list] = [
@@ -1111,16 +1116,31 @@ def generate_schedule(
         # 疊加「硬規則4：每週至多兩種班別」（絕對值，見下方）後，會自然逼迫求解器
         # 讓該週自由格只保留原兩種班別中的其中一種（例如輪班DE遇例外N → 自由格收斂為全D或全E）
         fixed_si = FIXED_SHIFT_MAP.get(attr)
+        # 個別護理師偏離配額(來自 rules.data.nurse_deviation_overrides,per-nurse 允許偏 attr 幾天)
+        _rot_dev_cap = _nurse_dev_overrides.get(uid, 0)   # 輪班 attr default 0(嚴格)
         if fixed_si is None:
             allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
             allowed_si = set(SI[s] for s in allowed) | {3}
             if "allowed" not in DEBUG_SKIP:
-                for t in range(n):
-                    if t in exception_days_m:
-                        continue  # 屬性衝突的預填日：保留預填值，跳過班種限制
-                    for s in range(4):
-                        if s not in allowed_si:
-                            model.add(b[m][t][s] == 0)
+                if _rot_dev_cap > 0:
+                    # 允許偏 attr 次數:非 attr 的班別總和 ≤ cap
+                    _dev_terms = []
+                    for t in range(n):
+                        if t in exception_days_m:
+                            continue
+                        for s in range(4):
+                            if s not in allowed_si:
+                                _dev_terms.append(b[m][t][s])
+                    if _dev_terms:
+                        model.add(sum(_dev_terms) <= _rot_dev_cap)
+                else:
+                    # 嚴格禁止非 attr 班別
+                    for t in range(n):
+                        if t in exception_days_m:
+                            continue  # 屬性衝突的預填日:保留預填值,跳過班種限制
+                        for s in range(4):
+                            if s not in allowed_si:
+                                model.add(b[m][t][s] == 0)
 
         # ── 休假天數（LEAVE_ADJUST 不計入應休名額）
         la_count = len(leave_adjust_days_m)
@@ -1131,18 +1151,20 @@ def generate_schedule(
         # 應休 OFF（排除 LEAVE_ADJUST）
         free_off = [b[m][t][3] for t in range(n) if t not in leave_adjust_days_m]
         # 軟規則 E：人力不足時允許縮減應休天數（off_slack，最多 -2 天）
-        off_slack = model.new_int_var(0, 2, f"off_slack_{m}")
+        _slack_max = max(0, pen("SLACK_MAX_PER_NURSE", 2))   # 每人少休上限(人力吃緊時可拉高至 5-7)
+        off_slack = model.new_int_var(0, _slack_max, f"off_slack_{m}")
         # 半職使用 slack 罰更重(讓 solver 優先填滿半職 quota,而非用 slack)
         _slack_pen_m = pen("SLACK_PENALTY_HALF", 1000) if is_ht else pen("SLACK_PENALTY_FULL", 200)
         off_slack_vars.append((m, off_slack, _slack_pen_m))
         if "offdays" not in DEBUG_SKIP:
-            model.add(sum(free_off) >= off_days - off_slack)  # 軟下限：最多縮減 2 天
+            model.add(sum(free_off) >= off_days - off_slack)  # 軟下限：最多縮減 SLACK_MAX_PER_NURSE 天
         # 超出應休天數的部分用高懲罰軟約束取代硬上限，避免供需差造成 INFEASIBLE
         # 全職過休比半職貴 → 讓 solver 優先把多餘 OFF 分給半職(填滿他們 quota),而非全職
         over_off = model.new_int_var(0, n, f"over_off_{m}")
         model.add(sum(free_off) <= off_days + over_off)
         _over_off_pen = pen("OVER_OFF_PENALTY_HALF", 500) if is_ht else pen("OVER_OFF_PENALTY_FULL", 1500)
         penalties.append(over_off * _over_off_pen)
+        over_off_vars.append((m, over_off))
 
         # ── 硬規則 2：反向班禁止（統一時間軸：history 邊界併入同一組約束，不特判第一天）
         # 允許模式：E, OFF, D  /  N, OFF, E  /  N, OFF, OFF, D
@@ -1400,18 +1422,59 @@ def generate_schedule(
         penalties.append(slack_var * _spen)
     # 軟規則 E：off_slack 公平分配，懲罰最大與最小差距（避免集中同一人）
     if off_slack_vars:
-        _max_sk = model.new_int_var(0, 2, "max_off_slack")
-        _min_sk = model.new_int_var(0, 2, "min_off_slack")
+        _sk_ub = max(0, pen("SLACK_MAX_PER_NURSE", 2))
+        _max_sk = model.new_int_var(0, _sk_ub, "max_off_slack")
+        _min_sk = model.new_int_var(0, _sk_ub, "min_off_slack")
         for _, sv, _ in off_slack_vars:
             model.add(_max_sk >= sv)
             model.add(_min_sk <= sv)
-        _sk_spread = model.new_int_var(0, 2, "slack_spread")
+        _sk_spread = model.new_int_var(0, _sk_ub, "slack_spread")
         model.add(_sk_spread == _max_sk - _min_sk)
         _SK_SPREAD_BASE = pen("SKILL_SPREAD_PENALTY", 400)
         penalties.append(_sk_spread * int(_SK_SPREAD_BASE * FAIR_MULT))
+        # 方案 C:實驗性硬約束 slack 差 ≤ N(default 0=關;1=強制大家 slack 最多差 1 天)
+        _slack_hard_cap = pen("SLACK_SPREAD_HARD_CAP", 0)
+        if _slack_hard_cap > 0:
+            _a_sk_hard = model.new_bool_var("a_slack_spread_hard")
+            model.add(_max_sk - _min_sk <= _slack_hard_cap).only_enforce_if(_a_sk_hard)
+            assume_reg.append((_a_sk_hard, f"slack 差 ≤ {_slack_hard_cap}(SLACK_SPREAD_HARD_CAP)"))
+            print(f"[SLACK-HARD] 硬約束啟用:max_slack - min_slack ≤ {_slack_hard_cap}")
     # leader/second 軟約束懲罰(注意:loop 變數不能叫 pen,會 shadow 全域 pen() 函式!)
     for miss_var, _pen_val in leader_miss_vars:
         penalties.append(miss_var * _pen_val)
+
+    # ── 硬規則 H18 應休優先(前端「休假規則」勾選控制,default True)
+    _off_priority_enabled = bool(scheduling.get("off_priority", True))
+    if _off_priority_enabled and off_slack_vars and over_off_vars and "off_priority" not in DEBUG_SKIP:
+        _sum_slack = sum(sv for _, sv, _ in off_slack_vars)
+        _sum_over  = sum(ov for _, ov in over_off_vars)
+        _any_slack = model.new_bool_var("any_slack_off")
+        _any_over  = model.new_bool_var("any_over_off")
+        model.add(_sum_slack >= 1).only_enforce_if(_any_slack)
+        model.add(_sum_slack == 0).only_enforce_if(_any_slack.negated())
+        model.add(_sum_over >= 1).only_enforce_if(_any_over)
+        model.add(_sum_over == 0).only_enforce_if(_any_over.negated())
+        _a_off_pri = model.new_bool_var("a_off_priority")
+        model.add(_any_slack + _any_over <= 1).only_enforce_if(_a_off_pri)
+        assume_reg.append((_a_off_pri, "應休優先 — 有人未休滿卻有人超休"))
+
+    # ── H7 雙週期比例硬上限:讀「管理員手動輸入」的上週期各護理師 D/E/N 計數
+    # 儲存位置:rules.data.prev_cycle_counts = { uid: {D, E, N} }
+    # 管理員在「手動填寫」tab 的「上週期」按鈕下輸入,不自動 sync DB shifts
+    _dual_cap = pen("RATIO_CAP_DAYS_DUAL", 0)
+    _prev_cycle_counts: dict[str, list[int]] = {}   # {uid: [d, e, n]}
+    if _dual_cap > 0:
+        _raw_pc = rules.get("prev_cycle_counts") or {}
+        for uid_r, cnts in _raw_pc.items():
+            if not isinstance(cnts, dict):
+                continue
+            d_v = int(cnts.get("D") or 0)
+            e_v = int(cnts.get("E") or 0)
+            n_v = int(cnts.get("N") or 0)
+            if d_v + e_v + n_v > 0:
+                _prev_cycle_counts[uid_r] = [d_v, e_v, n_v]
+        print(f"[H7-DUAL] 讀 rules.prev_cycle_counts:{len(_prev_cycle_counts)} 人有手動輸入的上週期資料")
+
     # 收集全體孤立日 bool vars（供 ISOLATED_MAX_TOTAL 硬上限使用）
     _all_iso_vars: list = []
     for m in range(M):
@@ -1440,9 +1503,12 @@ def generate_schedule(
                 v = ratio.get(attr_key)         # 2. 全體 ratio(attr-specific key)
             return max(1, int(v) if v is not None else 1)
 
-        def _add_pair_penalty(va, ra, vb, rb, label, locked_a=0, locked_b=0):
-            """懲罰 |va*rb - vb*ra|，tol = ra+rb-1（1:1 時 tol=1）；
-            硬上限 |diff| ≤ cap_days*(ra+rb)，若鎖定格已超過則放寬至鎖定值"""
+        def _add_pair_penalty(va, ra, vb, rb, label, locked_a=0, locked_b=0, prev_a=0, prev_b=0):
+            """懲罰 |va*rb - vb*ra|,tol = ra+rb-1(1:1 時 tol=1);
+            單月硬上限 |diff| ≤ cap_days*(ra+rb),鎖定格已超過則放寬。
+            雙月「軟」約束(若 _dual_cap>0 且有上月資料):
+              solver 盡量 |prev_diff + diff| ≤ _dual_cap*(ra+rb),超出以 slack 罰 H14_SOFT_PENALTY,
+              避免上月極端 → 本月完全無法補償 → INFEASIBLE 的情況"""
             tol  = ra + rb - 1
             diff = model.new_int_var(-(n * max(ra, rb)), n * max(ra, rb), f"pdiff_{label}")
             dev  = model.new_int_var(0, n * max(ra, rb), f"pdev_{label}")
@@ -1451,30 +1517,92 @@ def generate_schedule(
             model.add(dev >= -diff - tol)
             model.add(dev >= 0)
             penalties.append(dev * DIST_PENALTY)
-            # 硬上限（±cap_days 天，換算差值尺度）；鎖定既成事實已超過時讓路
+            # 單月硬上限（±cap_days 天,換算差值尺度）;鎖定既成事實已超過時讓路
             hard_cap = _cap_days * (ra + rb)
             locked_diff = abs(locked_a * rb - locked_b * ra)
             hard_cap = max(hard_cap, locked_diff)
             model.add(diff <= hard_cap)
             model.add(diff >= -hard_cap)
+            # H14 雙月「軟」約束:超出時以 slack 罰,不 INFEASIBLE(方案 A:硬撐不住就盡力補)
+            if _dual_cap > 0 and (prev_a > 0 or prev_b > 0):
+                prev_diff = prev_a * rb - prev_b * ra   # 常數
+                dual_hard = _dual_cap * (ra + rb)
+                _big = n * max(ra, rb) + abs(prev_diff) + dual_hard + 1
+                _dual_over  = model.new_int_var(0, _big, f"dover_{label}")
+                _dual_under = model.new_int_var(0, _big, f"dunder_{label}")
+                # diff + prev_diff <=  dual_hard + over
+                # diff + prev_diff >= -dual_hard - under
+                model.add(diff <=  dual_hard - prev_diff + _dual_over)
+                model.add(diff >= -dual_hard - prev_diff - _dual_under)
+                _h14_pen = pen("H14_SOFT_PENALTY", 1500)
+                if _h14_pen > 0:
+                    penalties.append((_dual_over + _dual_under) * _h14_pen)
 
+        # 上週期各班種計數(供雙週期硬上限用)
+        _pc_raw = _prev_cycle_counts.get(_uid_m, [0, 0, 0])
+        # 方案 B:跨 attr 偵測 —— 若上月有本月 attr 不允許的班種(用戶換 attr),H14 不套用
+        # 例:上月 attr=DN(D=3, N=17),本月 attr=DE → 上月 N=17 本月不允許 → 跳過 H14 避免 INFEASIBLE
+        _this_allowed_shifts = set(SHIFT_ALLOWED.get(attr, ["D","E","N"]))
+        _prev_shifts_present = set()
+        if _pc_raw[0] > 0: _prev_shifts_present.add("D")
+        if _pc_raw[1] > 0: _prev_shifts_present.add("E")
+        if _pc_raw[2] > 0: _prev_shifts_present.add("N")
+        _cross_attr = bool(_prev_shifts_present - _this_allowed_shifts)
+        if _cross_attr and _dual_cap > 0 and attr in ("輪班DE","輪班DN","輪班EN","輪班DEN"):
+            # 方案 C1:跨 attr 智慧補償 —— 對「共同班種」建「兩月加總目標」軟約束
+            # 上月 attr 未知 → 假設當時 attr 均勻分配(1:1 或 1:1:1),估「上月應有 s」
+            # 上月欠 s 天數 = 上月應有 s − 上月實際 s(正=欠,負=超)
+            # 本月 s 目標 = 本月應有 s + 上月欠 s
+            # 軟目標:|本月 s 天數 − target| ≤ dual_cap,超出以 H14_SOFT_PENALTY 罰
+            _common_shifts = _prev_shifts_present & _this_allowed_shifts
+            _prev_work_total = sum(_pc_raw)   # 上月總工作天數
+            _this_work_total = n - la_count   # 本月扣掉 LEAVE_ADJUST 的可上班天數估算(粗略)
+            _n_prev_shifts = max(1, len(_prev_shifts_present))
+            _n_this_shifts = max(1, len([s for s in _this_allowed_shifts if s in ("D","E","N")]))
+            _h14_pen_c1 = pen("H14_SOFT_PENALTY", 1500)
+            _si_map = {"D":0, "E":1, "N":2}
+            _b_map = {0: _total_d, 1: _total_e, 2: _total_nv}
+            if _common_shifts and _h14_pen_c1 > 0:
+                print(f"[H14-C1] {nurse_name} 跨 attr(上月{sorted(_prev_shifts_present)} → 本月 {attr}),對共同班種 {sorted(_common_shifts)} 做補償")
+                for _s in sorted(_common_shifts):
+                    _si = _si_map[_s]
+                    _prev_should = _prev_work_total / _n_prev_shifts
+                    _prev_deficit = _prev_should - _pc_raw[_si]  # 正=欠
+                    _this_should = _this_work_total / _n_this_shifts
+                    _target = int(round(_this_should + _prev_deficit))
+                    # 目標夾到 [0, this_work_total]
+                    _target = max(0, min(_this_work_total, _target))
+                    print(f"[H14-C1]   {_s}: 上月應{_prev_should:.1f}/實{_pc_raw[_si]} 欠{_prev_deficit:+.1f} → 本月目標{_target} (dual_cap={_dual_cap})")
+                    _c1_slack = model.new_int_var(0, n, f"c1_slack_{m}_{_s}")
+                    _c1_diff = model.new_int_var(-n, n, f"c1_diff_{m}_{_s}")
+                    model.add(_c1_diff == _b_map[_si] - _target)
+                    model.add(_c1_slack >= _c1_diff - _dual_cap)
+                    model.add(_c1_slack >= -_c1_diff - _dual_cap)
+                    model.add(_c1_slack >= 0)
+                    penalties.append(_c1_slack * _h14_pen_c1)
+            _pc = [0, 0, 0]   # 仍跳過 pair-based H14 避免疊加(C1 已補償)
+        elif _cross_attr:
+            print(f"[H14] {nurse_name} 跨 attr(上月{sorted(_prev_shifts_present)} vs 本月 attr={attr} 允許{sorted(_this_allowed_shifts)}),不套 H14")
+            _pc = [0, 0, 0]
+        else:
+            _pc = _pc_raw
         if attr == "輪班DE":
             _rd, _re = _r("de_d","D"), _r("de_e","E")
             print(f"[RATIO] {nurse_name} attr={attr} D:E = {_rd}:{_re}")
-            _add_pair_penalty(_total_d, _rd, _total_e, _re, f"de_{m}", _locked_cnt[0], _locked_cnt[1])
+            _add_pair_penalty(_total_d, _rd, _total_e, _re, f"de_{m}", _locked_cnt[0], _locked_cnt[1], _pc[0], _pc[1])
         elif attr == "輪班DN":
             _rd, _rn = _r("dn_d","D"), _r("dn_n","N")
             print(f"[RATIO] {nurse_name} attr={attr} D:N = {_rd}:{_rn}")
-            _add_pair_penalty(_total_d, _rd, _total_nv, _rn, f"dn_{m}", _locked_cnt[0], _locked_cnt[2])
+            _add_pair_penalty(_total_d, _rd, _total_nv, _rn, f"dn_{m}", _locked_cnt[0], _locked_cnt[2], _pc[0], _pc[2])
         elif attr == "輪班EN":
             _re, _rn = _r("en_e","E"), _r("en_n","N")
             print(f"[RATIO] {nurse_name} attr={attr} E:N = {_re}:{_rn}")
-            _add_pair_penalty(_total_e, _re, _total_nv, _rn, f"en_{m}", _locked_cnt[1], _locked_cnt[2])
+            _add_pair_penalty(_total_e, _re, _total_nv, _rn, f"en_{m}", _locked_cnt[1], _locked_cnt[2], _pc[1], _pc[2])
         elif attr == "輪班DEN":
             _rd, _re, _rn = _r("den_d","D"), _r("den_e","E"), _r("den_n","N")
             print(f"[RATIO] {nurse_name} attr={attr} D:E:N = {_rd}:{_re}:{_rn}")
-            _add_pair_penalty(_total_d, _rd, _total_e, _re, f"de_{m}", _locked_cnt[0], _locked_cnt[1])
-            _add_pair_penalty(_total_d, _rd, _total_nv, _rn, f"dn_{m}", _locked_cnt[0], _locked_cnt[2])
+            _add_pair_penalty(_total_d, _rd, _total_e, _re, f"de_{m}", _locked_cnt[0], _locked_cnt[1], _pc[0], _pc[1])
+            _add_pair_penalty(_total_d, _rd, _total_nv, _rn, f"dn_{m}", _locked_cnt[0], _locked_cnt[2], _pc[0], _pc[2])
         else:
             pass  # 固定班由 FIX_PENALTY 處理
 
@@ -1504,14 +1632,19 @@ def generate_schedule(
         # 「塊」= 同種上班班連續天數;遇 OFF/半/V/員/喪/延休/補休/調移 就斷開(已 lock 到 si=3)
         # 半職除外(工作天數少,塊本來就短)
         # smooth 版本把塊狀規則也乘 SWITCH_MULT(順班 = 少換班 + 塊狀 + 段數集中 是同一概念)
-        _short_pen = int(pen("SHORT_BLOCK_PENALTY", 2000) * SWITCH_MULT)
+        # 超短塊(1天) 與 短塊(2天) 分開兩個獨立參數:
+        # - ULTRA_SHORT_BLOCK_PENALTY 預設 3000(比 2 天更痛)
+        # - SHORT_BLOCK_PENALTY 預設 500
+        # 舊 SHORT_BLOCK_PENALTY 保留兼容:若有 ULTRA 就用 ULTRA,否則 fallback SHORT×2
+        _short2_pen = int(pen("SHORT_BLOCK_PENALTY", 500) * SWITCH_MULT)   # 2 天塊
+        _ultra_pen  = int(pen("ULTRA_SHORT_BLOCK_PENALTY", 3000) * SWITCH_MULT)  # 1 天塊
         _long_pen = int(pen("LONG_BLOCK_PENALTY", 800) * SWITCH_MULT)
         _mid_reward = int(pen("MID_BLOCK_REWARD", 500) * SWITCH_MULT)  # 3-4 天塊獎勵(建模時取負)
-        if (_short_pen > 0 or _long_pen > 0 or _mid_reward > 0) and not is_ht:
+        if (_short2_pen > 0 or _ultra_pen > 0 or _long_pen > 0 or _mid_reward > 0) and not is_ht:
             for _s in (0, 1, 2):  # 對 D/E/N 各自算塊
                 for t in range(n):
-                    # 短塊 len=1: b[t][s]=1 且 前/後都不是 s(或邊界);階梯罰 = 懲罰值 × 2
-                    if _short_pen > 0:
+                    # 超短塊 len=1: b[t][s]=1 且 前/後都不是 s(或邊界)
+                    if _ultra_pen > 0:
                         _len1 = model.new_bool_var(f"blk1_{m}_{_s}_{t}")
                         _terms1 = [b[m][t][_s]]
                         if t > 0: _terms1.append(1 - b[m][t-1][_s])
@@ -1519,10 +1652,10 @@ def generate_schedule(
                         model.add(_len1 >= sum(_terms1) - (len(_terms1) - 1))
                         for _tm in _terms1:
                             model.add(_len1 <= _tm)
-                        penalties.append(_len1 * (_short_pen * 2))
+                        penalties.append(_len1 * _ultra_pen)
 
-                    # 短塊 len=2: b[t][s]=b[t+1][s]=1 且 前/後都不是 s;階梯罰 = 懲罰值 × 1
-                    if _short_pen > 0 and t <= n - 2:
+                    # 短塊 len=2: b[t][s]=b[t+1][s]=1 且 前/後都不是 s
+                    if _short2_pen > 0 and t <= n - 2:
                         _len2 = model.new_bool_var(f"blk2_{m}_{_s}_{t}")
                         _terms2 = [b[m][t][_s], b[m][t+1][_s]]
                         if t > 0: _terms2.append(1 - b[m][t-1][_s])
@@ -1530,7 +1663,7 @@ def generate_schedule(
                         model.add(_len2 >= sum(_terms2) - (len(_terms2) - 1))
                         for _tm in _terms2:
                             model.add(_len2 <= _tm)
-                        penalties.append(_len2 * _short_pen)
+                        penalties.append(_len2 * _short2_pen)
 
                     # 中塊 len=3(甜蜜區獎勵):b[t..t+2][s]=1 且 前/後都不是 s
                     if _mid_reward > 0 and t <= n - 3:
@@ -1568,39 +1701,56 @@ def generate_schedule(
         # 「段」定義:只看真正上班的工作日順序(OFF/半/V/員/喪/延休/補休/調移 全部穿透)
         # 例:D D OFF D D → 1 段 D;D E D → 2 段 D(E 打斷);D V V D → 1 段 D
         # 用「延續鏈」chain[t] = t 屬於某個 s 段的延續或起點
-        _seg_pen = int(pen("SEGMENT_PENALTY", 3000) * SWITCH_MULT)
-        if _seg_pen > 0:
-            for _s in (0, 1, 2):
-                # chain[t] = b[t][s] OR (chain[t-1] AND b[t][3])
-                chain = []
-                for t in range(n):
-                    ch = model.new_bool_var(f"chain_{m}_{_s}_{t}")
-                    if t == 0:
-                        model.add(ch == b[m][0][_s])
-                    else:
-                        cont = model.new_bool_var(f"cont_{m}_{_s}_{t}")
-                        model.add(cont <= chain[t-1])
-                        model.add(cont <= b[m][t][3])
-                        model.add(cont >= chain[t-1] + b[m][t][3] - 1)
-                        model.add(ch >= b[m][t][_s])
-                        model.add(ch >= cont)
-                        model.add(ch <= b[m][t][_s] + cont)
-                    chain.append(ch)
+        # S11:seg_start_vars 一律建(硬上限需要),軟罰只在 _seg_pen>0 時 append
+        _seg_pen = int(pen("SEGMENT_PENALTY", 5000) * SWITCH_MULT)
+        _all_seg_starts_this_m: list = []
+        for _s in (0, 1, 2):
+            # chain[t] = b[t][s] OR (chain[t-1] AND b[t][3])
+            chain = []
+            for t in range(n):
+                ch = model.new_bool_var(f"chain_{m}_{_s}_{t}")
+                if t == 0:
+                    model.add(ch == b[m][0][_s])
+                else:
+                    cont = model.new_bool_var(f"cont_{m}_{_s}_{t}")
+                    model.add(cont <= chain[t-1])
+                    model.add(cont <= b[m][t][3])
+                    model.add(cont >= chain[t-1] + b[m][t][3] - 1)
+                    model.add(ch >= b[m][t][_s])
+                    model.add(ch >= cont)
+                    model.add(ch <= b[m][t][_s] + cont)
+                chain.append(ch)
 
-                # seg_start[t] = b[t][s]=1 AND (t=0 OR chain[t-1]=0)
-                seg_start_vars: list = []
-                seg_start_vars.append(b[m][0][_s])  # t=0
-                for t in range(1, n):
-                    st = model.new_bool_var(f"segstart_{m}_{_s}_{t}")
-                    model.add(st <= b[m][t][_s])
-                    model.add(st <= 1 - chain[t-1])
-                    model.add(st >= b[m][t][_s] - chain[t-1])
-                    seg_start_vars.append(st)
+            # seg_start[t] = b[t][s]=1 AND (t=0 OR chain[t-1]=0)
+            seg_start_vars: list = []
+            seg_start_vars.append(b[m][0][_s])  # t=0
+            for t in range(1, n):
+                st = model.new_bool_var(f"segstart_{m}_{_s}_{t}")
+                model.add(st <= b[m][t][_s])
+                model.add(st <= 1 - chain[t-1])
+                model.add(st >= b[m][t][_s] - chain[t-1])
+                seg_start_vars.append(st)
 
-                # 段數超過 1 每多罰 SEGMENT_PENALTY
+            # 軟罰:段數超過 1 每多罰 SEGMENT_PENALTY(_seg_pen=0 時 skip)
+            if _seg_pen > 0:
                 _seg_over = model.new_int_var(0, n, f"seg_over_{m}_{_s}")
                 model.add(_seg_over >= sum(seg_start_vars) - 1)
                 penalties.append(_seg_over * _seg_pen)
+
+            # 累加本人所有班種的 seg_start(供 S11 硬上限用,一律收集)
+            _all_seg_starts_this_m.extend(seg_start_vars)
+
+        # ── S11 硬上限:每人整週期「所有班種段數加總」上限(2026-08-24 加,可調)
+        # 進階調參可調 SEG_HARD_CAP_2(輪班2種)、SEG_HARD_CAP_3(輪班DEN);設 0 = 關閉此硬規則
+        _is_ht_here = bool(nurses[m].get("halftime"))
+        _nurse_name_here = nurses[m].get("name") or nurses[m]["uid"]   # 本地重取,避免用其他 loop 殘留
+        if _all_seg_starts_this_m and not _is_ht_here and fixed_si is None:
+            _allowed = SHIFT_ALLOWED.get(attr, ["D","E","N"])
+            _seg_hard_cap = pen("SEG_HARD_CAP_3", 6) if len(_allowed) >= 3 else pen("SEG_HARD_CAP_2", 5)
+            if _seg_hard_cap > 0:   # 0 = 關掉硬規則
+                _a_seg = model.new_bool_var(f"a_seg_hard_{m}")
+                model.add(sum(_all_seg_starts_this_m) <= _seg_hard_cap).only_enforce_if(_a_seg)
+                assume_reg.append((_a_seg, f"{attr}班種段數加總 ≤ {_seg_hard_cap} — {_nurse_name_here}"))
 
         if fixed_si is not None:
             # 固定班：偏離固定班種每格罰 FIX_PENALTY；並硬性限制偏離格數上限（fair版=0，其他版=2）
@@ -1612,9 +1762,11 @@ def generate_schedule(
                             penalties.append(b[m][t][s] * FIX_PENALTY)
                             deviation_terms.append(b[m][t][s])
             if deviation_terms:
-                # 硬上限：偏離格數 ≤ FIX_MAX_DEVIATION；預填鎖定已超過時放寬至既成值，避免 INFEASIBLE
+                # 硬上限：偏離格數 ≤ FIX_MAX_DEVIATION;預填鎖定已超過時放寬,個別護理師覆蓋優先
                 locked_dev = sum(_locked_cnt[s] for s in range(3) if s != fixed_si)
-                _fix_cap = max(FIX_MAX_DEVIATION, locked_dev)
+                # 讀取 per-nurse override(rules.data.nurse_deviation_overrides)
+                _nurse_dev_here = _nurse_dev_overrides.get(uid, FIX_MAX_DEVIATION)
+                _fix_cap = max(_nurse_dev_here, locked_dev)
                 _a_fix = model.new_bool_var(f"a_fix_{m}")
                 model.add(sum(deviation_terms) <= _fix_cap).only_enforce_if(_a_fix)
                 assume_reg.append((_a_fix, f"{attr}固定班別(偏離≤{_fix_cap}格) — {nurse_name}"))
@@ -1915,33 +2067,63 @@ def generate_schedule(
 
     def _build_solver(seed=None):
         _s = cp_model.CpSolver()
-        _s.parameters.max_time_in_seconds = pen_float("MAIN_SOLVE_SECONDS", 90)
+        # 各 profile 可各自設 solve 時間(如 balanced 因走 fallback 較久,default 120s 避免 Railway 300s 超時)
+        # 讀取優先序:profile 專屬 key > 通用 MAIN_SOLVE_SECONDS > profile-specific hardcoded default
+        _prof_key = f"MAIN_SOLVE_SECONDS_{profile.upper()}"
+        # 各 profile 預設 120s(fallback 一次 = 240s + diag 45 = 285s 剛好 fit Railway 300s)
+        _prof_default = 120
+        _prof_secs = pen_float(_prof_key, _prof_default)
+        _s.parameters.max_time_in_seconds = _prof_secs if _prof_secs > 0 else pen_float("MAIN_SOLVE_SECONDS", 180)
         _s.parameters.num_workers = pen("MAIN_SOLVE_WORKERS", 4)
         _s.parameters.repair_hint = True
         _s.parameters.linearization_level = 2
+        # 前端 checkbox「隨機探索」勾選 → CP-SAT 隨機化搜尋(捨棄智慧啟發式,適合都卡住時)
+        if random_search:
+            _s.parameters.randomize_search = True
         if seed is not None:
             _s.parameters.random_seed = seed
         return _s
 
-    # seed 選擇:env CP_SAT_SEED > 0 用該值;否則 balanced 用 42(實測 obj -10.2%),其他 profile 用 default
+    # seed 挑選邏輯:
+    # 1. 前端傳的 seed > 0 → 用它當首選
+    # 2. env CP_SAT_SEED > 0 → 用它
+    # 3. balanced default → seed=12345(實測最佳,memory 記載)
+    # 4. 其他 profile → 用 default seed(不指定)
+    # Seed 池 per profile(實測最佳排序,順序=首選→fallback)
+    _seed_pools = {
+        "balanced": [12345, 42, 7, 137, 0],   # 平衡版:seed=12345 最佳
+        "smooth":   [7, 42, 137, 0, 1000],    # 順班版:seed=7 最佳(2026-08-24 實驗)
+        "fair":     [1, 12345, 42, 137, 1000],# 公平版:seed=1(等同 default) 最佳
+    }
     _cp_seed = int(os.getenv("CP_SAT_SEED", "0") or "0")
-    if _cp_seed > 0:
-        solver = _build_solver(seed=_cp_seed)
-        print(f"[SOLVE] using seed={_cp_seed} (from env)")
-    elif profile == "balanced":
-        solver = _build_solver(seed=42)
-        print(f"[SOLVE] using seed=42 (balanced profile,實測改善 -10.2%)")
+    _pool = _seed_pools.get(profile, [1])
+
+    _first_seed = None
+    if seed > 0:
+        _first_seed = seed
+    elif _cp_seed > 0:
+        _first_seed = _cp_seed
     else:
-        solver = _build_solver()
+        _first_seed = _pool[0]
+
+    _used_seed = _first_seed
+    solver = _build_solver(seed=_first_seed)
+    print(f"[SOLVE] profile={profile} using seed={_first_seed}{' (random_search=ON)' if random_search else ''}")
     status = solver.solve(model)
     print(f"[SOLVE] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
-    # Fallback:balanced 若 seed=42 卡住 UNKNOWN,退回 default seed 再試一次
-    if profile == "balanced" and _cp_seed == 0 and status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print(f"[SOLVE FALLBACK] seed=42 卡住(status={solver.status_name(status)}),退回 default seed 再試")
-        solver = _build_solver()
-        status = solver.solve(model)
-        print(f"[SOLVE FALLBACK] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
+
+    # Fallback:任何 profile UNKNOWN 都自動輪替下一 seed(從 pool 挑一個不同的)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        _next_seed = next((s for s in _pool if s != _first_seed), _first_seed)
+        if _next_seed != _first_seed:
+            print(f"[SOLVE FALLBACK] {profile} seed={_first_seed} 卡住,換 seed={_next_seed} 再試")
+            solver = _build_solver(seed=_next_seed)
+            _used_seed = _next_seed
+            status = solver.solve(model)
+            print(f"[SOLVE FALLBACK] status={solver.status_name(status)}  wall_time={solver.wall_time:.1f}s")
     _main_obj = None
+    _local_snapshot_fallback = None   # 保留變數但不再使用(改用 fresh solver 復原)
+    _rescued_objective = None         # 保留變數但不再使用
     _main_bound = None
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         try:
@@ -1975,7 +2157,7 @@ def generate_schedule(
                     _cur_sol[(_m, _t)] = solver.value(x[_m][_t])
             # 2. 挑熱點:估算每人「段數+短塊」懲罰,半職除外
             _nurse_scores = []
-            _seg_pen_c = pen("SEGMENT_PENALTY", 3000)
+            _seg_pen_c = pen("SEGMENT_PENALTY", 5000)
             for _m in range(M):
                 if nurses[_m].get("halftime"):
                     continue
@@ -2009,6 +2191,14 @@ def generate_schedule(
                 # 4. 快照主 solve 的解(re-solve 若更差,fallback 用這個)
                 _main_snapshot = {(_m, _t): _cur_sol[(_m, _t)] for _m in range(M) for _t in range(n)}
                 # 加 hint 引導 solver 從主解起點微調(避免亂走)
+                # ⚠ 先清掉外部 warm-start 已加的 hint,避免同一變數重複 hint → MODEL_INVALID
+                try:
+                    model.clear_hints()   # OR-Tools 9.x+
+                except AttributeError:
+                    try:
+                        model.proto.solution_hint.Clear()   # 舊版 API
+                    except Exception:
+                        pass
                 try:
                     for _m in range(M):
                         for _t in range(n):
@@ -2019,6 +2209,7 @@ def generate_schedule(
                 solver.parameters.max_time_in_seconds = _local_seconds
                 _new_status = solver.solve(model)
                 print(f"[LOCAL-RESOLVE] status={solver.status_name(_new_status)}  wall_time={solver.wall_time:.1f}s")
+                _accepted = False
                 if _new_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     _new_obj = solver.objective_value
                     _new_bound = solver.best_objective_bound
@@ -2028,14 +2219,35 @@ def generate_schedule(
                     if _new_obj < _main_obj:
                         print(f"[LOCAL-RESOLVE] objective {_main_obj:.0f} → {_new_obj:.0f}  (改善 {_improve:.1f}%,新 gap {_new_gap:.1f}%) ACCEPTED")
                         status = _new_status
+                        _accepted = True
                     else:
                         print(f"[LOCAL-RESOLVE] objective {_main_obj:.0f} → {_new_obj:.0f}  (未改善,fallback 到主解 snapshot)")
-                        # 重加 hard constraint 鎖住 snapshot(讓後續 solver.value() 讀到主解值)
+                else:
+                    # MODEL_INVALID / UNKNOWN / INFEASIBLE:local-resolve 讓 solver 內部值失效,必須 fallback
+                    print(f"[LOCAL-RESOLVE] status={solver.status_name(_new_status)} 非可行,fallback 到主解 snapshot")
+
+                if not _accepted:
+                    # 鎖 snapshot 硬約束,並用「新 solver 實例」重解,避免舊 solver 內部污染的 value() 亂數
+                    _restore_ok = False
+                    try:
                         for (_m, _t), _v in _main_snapshot.items():
                             try: model.add(x[_m][_t] == _v)
                             except Exception: pass
-                        solver.solve(model)
-                        status = cp_model.OPTIMAL
+                        _fresh_solver = cp_model.CpSolver()
+                        _fresh_solver.parameters.max_time_in_seconds = 30.0
+                        _fresh_solver.parameters.num_search_workers = 8
+                        _restore_status = _fresh_solver.solve(model)
+                        print(f"[LOCAL-RESOLVE] fresh solver restore status={_fresh_solver.status_name(_restore_status)}")
+                        if _restore_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                            solver = _fresh_solver   # ← 關鍵:切換到新 solver,後續所有 solver.value() 都乾淨
+                            status = _restore_status
+                            _restore_ok = True
+                    except Exception as _e:
+                        print(f"[LOCAL-RESOLVE] snapshot 復原例外: {_e}")
+                    if not _restore_ok:
+                        # 連 fresh solver 都復原不了 → 模型已完全污染,只能報錯讓上層走 diag 救援
+                        print("[LOCAL-RESOLVE] snapshot 復原完全失敗,交給 diag 救援")
+                        status = cp_model.UNKNOWN   # 讓下方 diag rescue 接手
 
     # ── 主解失敗（UNKNOWN 逾時 或 INFEASIBLE）：跑一次「純可行性」診斷解。
     #    移除目標函數（最佳化才是主要負擔）＋較短時限，讓求解器能真正判定可行性：
@@ -2230,11 +2442,127 @@ def generate_schedule(
 
         raise HTTPException(400, detail)
 
+    # ── SA post-processing (Phase 1): swap 2 nurses same-day work shifts
+    # 只在 solve 成功時跑;不會讓解更差(best-so-far 機制);典型節省 20-40% 軟分
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) and pen("SA_ENABLED", 1) > 0:
+        try:
+            from sa_polish import sa_polish, SAContext
+
+            # 取當前解
+            _sa_assign: dict = {}
+            for _m in range(M):
+                for _t in range(n):
+                    try:
+                        _sa_assign[(_m, _t)] = int(solver.value(x[_m][_t]))
+                    except Exception:
+                        _sa_assign[(_m, _t)] = 3
+
+            # 建 fixed_cells:所有 existing 中有 shift 被鎖的格
+            _sa_fixed_cells: set = set()
+            for _mi, _nu in enumerate(nurses):
+                _uid = _nu["uid"]
+                for _t, _d_str in enumerate(cycle_dates):
+                    _key = (_uid, _d_str)
+                    if _key in existing:
+                        _row = existing[_key]
+                        if _row.get("shift"):
+                            # confirmed + overwrite_confirmed 不鎖(但 overwrite_confirmed=False 恆定)
+                            if not (_row.get("confirmed") and overwrite_confirmed):
+                                _sa_fixed_cells.add((_mi, _t))
+                    # 第一天 lock:若 lock_first_day 且 t==0 且無 existing → 也不鎖(讓 SA 可動)
+                    #   若有 existing 已由上一段涵蓋
+            # 每人 attr 相關資訊
+            _sa_attr_map = {_m: (nurses[_m].get("attr") or "輪班DEN") for _m in range(M)}
+            _sa_halftime = {_m: bool(nurses[_m].get("halftime")) for _m in range(M)}
+            _sa_trainee = set(trainee_set)
+            _sa_is_leader = {_m: (nurses[_m].get("level") == "leader") for _m in range(M)}
+            _sa_is_ls = {_m: (nurses[_m].get("level") in ("leader", "second")) for _m in range(M)}
+
+            # allowed_si per nurse(含 3=OFF)
+            _sa_allowed_si: dict = {}
+            for _m in range(M):
+                _attr = _sa_attr_map[_m]
+                _allowed = SHIFT_ALLOWED.get(_attr, WORK_SHIFTS)
+                _sa_allowed_si[_m] = {SI[_s] for _s in _allowed} | {3}
+            _sa_fixed_si = {_m: FIXED_SHIFT_MAP.get(_sa_attr_map[_m]) for _m in range(M)}
+            _sa_dev_cap = {_m: _nurse_dev_overrides.get(nurses[_m]["uid"], 0) for _m in range(M)}
+
+            # 建 ratio pairs per nurse(依 attr 建 2/3 pairs)
+            def _sa_r(attr_key: str, generic_key: str, uid: str) -> int:
+                _ov = ratio_overrides.get(uid, {})
+                v = _ov.get(generic_key)
+                if v is None:
+                    v = ratio.get(attr_key)
+                return max(1, int(v) if v is not None else 1)
+            _sa_pairs: dict = {}
+            for _m, _nu in enumerate(nurses):
+                _attr = _sa_attr_map[_m]
+                _uid = _nu["uid"]
+                _p = []
+                if _attr == "輪班DE":
+                    _p.append((0, _sa_r("de_d", "D", _uid), 1, _sa_r("de_e", "E", _uid)))
+                elif _attr == "輪班DN":
+                    _p.append((0, _sa_r("dn_d", "D", _uid), 2, _sa_r("dn_n", "N", _uid)))
+                elif _attr == "輪班EN":
+                    _p.append((1, _sa_r("en_e", "E", _uid), 2, _sa_r("en_n", "N", _uid)))
+                elif _attr == "輪班DEN":
+                    _rd = _sa_r("den_d", "D", _uid); _re = _sa_r("den_e", "E", _uid); _rn = _sa_r("den_n", "N", _uid)
+                    _p.append((0, _rd, 1, _re))
+                    _p.append((0, _rd, 2, _rn))
+                    _p.append((1, _re, 2, _rn))
+                _sa_pairs[_m] = _p
+
+            _sa_ctx = SAContext(
+                M=M, n=n,
+                attr_map=_sa_attr_map,
+                halftime=_sa_halftime,
+                trainee=_sa_trainee,
+                is_leader=_sa_is_leader,
+                is_leader_or_second=_sa_is_ls,
+                allowed_si=_sa_allowed_si,
+                dev_cap_rot=_sa_dev_cap,
+                fixed_si=_sa_fixed_si,
+                fixed_cells=_sa_fixed_cells,
+                admin_cells=admin_cells,
+                day_d=day_d, day_e=day_e, day_n=day_n,
+                max_consec=max_consec,
+                weekly_ranges=weeks,
+                hist_si=hist_si,
+                ratio_pairs=_sa_pairs,
+                seg_pen=int(pen("SEGMENT_PENALTY", 5000) * SWITCH_MULT),
+                ultra_pen=int(pen("ULTRA_SHORT_BLOCK_PENALTY", 3000) * SWITCH_MULT),
+                short_pen=int(pen("SHORT_BLOCK_PENALTY", 500) * SWITCH_MULT),
+                dist_pen=int(pen("DIST_PENALTY", 900) * FAIR_MULT),
+                max_seconds=pen_float("SA_SECONDS", 30.0),
+                max_iter=pen("SA_MAX_ITER", 100000),
+                T0=pen_float("SA_T0", 10000.0),
+                cooling=pen_float("SA_COOLING", 0.9995),
+                no_improve_limit=pen("SA_NO_IMPROVE", 20000),
+                seed=_used_seed,
+            )
+            _sa_best, _sa_stats = sa_polish(_sa_assign, _sa_ctx, logger=print)
+            # 用 SA 結果覆寫,讓 _xval 讀新解
+            _local_snapshot_fallback = _sa_best
+        except Exception as _sa_e:
+            print(f"[SA] polish 失敗,fallback 到 CP-SAT 解: {_sa_e}")
+            import traceback; traceback.print_exc()
+
     # ── 解析結果
     SHIFT_NAMES = ["D", "E", "N", "OFF"]
+    def _xval(m: int, t: int) -> int:
+        """安全讀取 x[m][t] 的值:優先讀 snapshot fallback,並 clamp 到 [0,3] 防呆。"""
+        if _local_snapshot_fallback is not None:
+            v = _local_snapshot_fallback.get((m, t), 3)
+        else:
+            v = solver.value(x[m][t])
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            v = 3
+        return max(0, min(3, v))
     schedules: dict[str, list[str]] = {}
     for m, nurse in enumerate(nurses):
-        sched = [SHIFT_NAMES[solver.value(x[m][t])] for t in range(n)]
+        sched = [SHIFT_NAMES[_xval(m, t)] for t in range(n)]
         # 還原特休、指定休（不被 CP-SAT 覆蓋，從 existing 讀回）
         for t, d_str in enumerate(cycle_dates):
             key = (nurse["uid"], d_str)
@@ -2248,24 +2576,42 @@ def generate_schedule(
                     sched[t] = orig  # 應休類（如半）：保留原班碼
         schedules[nurse["uid"]] = sched
 
-    # ── 人力不足警告（off_slack > 0）
+    # ── 人力不足警告(改用「實際計算」而不是 solver 決策變數,避免 solver FEASIBLE 時 slack_var
+    # 值大於實際少休天數導致警告不準)
     warnings: list[str] = []
     if rescued_warning:
         warnings.append("⚠ " + rescued_warning)
-    reduced_nurses = []
+    _slack_groups: dict[int, list[str]] = {}
+    _no_reduce: list[str] = []
     for mi, slack_var, _ in off_slack_vars:
-        v = solver.value(slack_var)
-        if v > 0:
-            nm = nurses[mi].get("name") or nurses[mi]["uid"]
-            reduced_nurses.append(f"{nm}（減 {v} 天）")
-    if reduced_nurses:
-        warnings.append("⚠ 人力不足，以下護理師應休天數已自動縮減：" + "、".join(reduced_nurses))
+        nm = nurses[mi].get("name") or nurses[mi]["uid"]
+        # 用 _xval 讀 SA 後的最新解,算實際 free_off (OFF/半),排除 LEAVE_ADJUST(V/員/喪/延休/補休/調移)
+        # 因為 LA 也鎖成 x=3,若直接用 x==3 會把 V 也算「休」,誤判為沒減少
+        _la_set_w = leave_adjust_per_m.get(mi, set())
+        _actual_free_off = sum(1 for _t in range(n) if _xval(mi, _t) == 3 and _t not in _la_set_w)
+        # 該人的應休 quota:半職 part_off、否則 full_off,再扣 la_count 上限
+        _is_ht_w = bool(nurses[mi].get("halftime"))
+        _guaranteed_w = part_off if _is_ht_w else full_off
+        _la_cnt_w = len(_la_set_w)
+        _quota_w = max(0, min(_guaranteed_w, n - _la_cnt_w - 1))
+        _actual_reduce = max(0, _quota_w - _actual_free_off)
+        if _actual_reduce > 0:
+            _slack_groups.setdefault(_actual_reduce, []).append(nm)
+        else:
+            _no_reduce.append(nm)
+    if _slack_groups:
+        _lines: list[str] = []
+        for _days in sorted(_slack_groups.keys(), reverse=True):
+            _lines.append(f"減 {_days} 天:{'、'.join(_slack_groups[_days])}")
+        if _no_reduce:
+            _lines.append(f"沒減少:{'、'.join(_no_reduce)}")
+        warnings.append("⚠ 人力不足,以下護理師應休天數已自動縮減:\n  " + "\n  ".join(_lines))
 
     # ── 異常偵測
     anomalies: list[str] = []
     SHIFT_NAMES_DETECT = ["D", "E", "N", "OFF"]
     for mi, nurse in enumerate(nurses):
-        sched_m = [SHIFT_NAMES_DETECT[solver.value(x[mi][t])] for t in range(n)]
+        sched_m = [SHIFT_NAMES_DETECT[_xval(mi, t)] for t in range(n)]
         nm = nurse.get("name") or nurse["uid"]
         prev_m = hist_raw_by_nurse.get(nurse["uid"], ["OFF"] * HISTORY_DAYS)
         combined = prev_m + sched_m
@@ -2287,16 +2633,19 @@ def generate_schedule(
             if not any(solver.value(b[li][t][si]) for li in leader_indices):
                 anomalies.append(f"⚠ {cycle_dates[t]} {sh}班：無 leader 排班")
 
-    # ── Post-solve 驗證：確認每日臨床人數（不含新人）剛好等於需求
+    # ── Post-solve 驗證：確認每日臨床人數（不含新人、不含行政班）剛好等於需求
     demand_violations: list[str] = []
     for t in range(n):
-        # 排除新人（他們是額外人力，不算入 D/E/N 需求）
-        actual_d = sum(solver.value(b[m][t][0]) for m in range(M) if m not in trainee_set)
-        actual_e = sum(solver.value(b[m][t][1]) for m in range(M) if m not in trainee_set)
-        actual_n = sum(solver.value(b[m][t][2]) for m in range(M) if m not in trainee_set)
+        # 排除新人 + 行政班(會/公/書 內部視同 D 但不佔臨床名額,S1 constraint 也是這樣排除)
+        actual_d = sum(solver.value(b[m][t][0]) for m in range(M)
+                       if m not in trainee_set and (m, t) not in admin_cells)
+        actual_e = sum(solver.value(b[m][t][1]) for m in range(M)
+                       if m not in trainee_set and (m, t) not in admin_cells)
+        actual_n = sum(solver.value(b[m][t][2]) for m in range(M)
+                       if m not in trainee_set and (m, t) not in admin_cells)
         if actual_d != day_d[t] or actual_e != day_e[t] or actual_n != day_n[t]:
             demand_violations.append(
-                f"⚠ {cycle_dates[t]}：D={actual_d}（需{day_d[t]}）E={actual_e}（需{day_e[t]}）N={actual_n}（需{day_n[t]}）（不含新人）"
+                f"⚠ {cycle_dates[t]}：D={actual_d}（需{day_d[t]}）E={actual_e}（需{day_e[t]}）N={actual_n}（需{day_n[t]}）（不含新人／行政班）"
             )
     if demand_violations:
         for v in demand_violations:
@@ -2346,8 +2695,9 @@ def generate_schedule(
     # 每人 pq(person_quality)= 該人所有軟 penalty 加總,只計全職
     # 對齊 solver:除 ISO 外全部乘 SWITCH_MULT(smooth 版加乘)
     _pq_pens = {
-        "SEG": int(pen("SEGMENT_PENALTY", 3000) * SWITCH_MULT),
-        "SHORT": int(pen("SHORT_BLOCK_PENALTY", 2000) * SWITCH_MULT),
+        "SEG": int(pen("SEGMENT_PENALTY", 5000) * SWITCH_MULT),
+        "ULTRA": int(pen("ULTRA_SHORT_BLOCK_PENALTY", 3000) * SWITCH_MULT),
+        "SHORT": int(pen("SHORT_BLOCK_PENALTY", 500) * SWITCH_MULT),
         "MID": int(pen("MID_BLOCK_REWARD", 500) * SWITCH_MULT),
         "LONG": int(pen("LONG_BLOCK_PENALTY", 800) * SWITCH_MULT),
         "ISO": pen("ISOLATED_WORK_PENALTY", 750),   # solver 沒乘 SWITCH_MULT
@@ -2415,7 +2765,7 @@ def generate_schedule(
             _min_sw = max(0, _ntypes - 1)
             _excess_sw = max(0, _sw_cnt - _min_sw)
             _pq = (_seg_over * _pq_pens['SEG']
-                   + _l1 * _pq_pens['SHORT'] * 2 + _l2 * _pq_pens['SHORT']
+                   + _l1 * _pq_pens['ULTRA'] + _l2 * _pq_pens['SHORT']
                    - _l34 * _pq_pens['MID'] + _l5 * _pq_pens['LONG']
                    + _iso_cnt * _pq_pens['ISO']
                    + _excess_sw * _pq_pens['EXCESS']
@@ -2465,13 +2815,18 @@ def generate_schedule(
             "isolated_days": metric_isolated,
             "max_ratio_dev": metric_max_dev,
             "person_quality": person_quality,   # {name: score} 只含全職;供前端顯示每人分數
-            # 若走 diag 救援(objective 已被清),objective_value = 0 是假的 → 標 None 讓前端顯示「救援解」
-            # 用 solver.objective_value 拿最終解(可能 LOCAL-RESOLVE 更好);bound 用主 solve 保留值(縮小問題的 bound 誤導)
-            "objective_value": (None if rescued_warning else (solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None)),
+            # 優先序:snapshot fallback 用主解值 → diag 救援用 None → 正常用 solver.objective_value
+            # bound 用主 solve 保留值(縮小問題的 bound 誤導)
+            "objective_value": (
+                _rescued_objective if _rescued_objective is not None
+                else (None if rescued_warning else (solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None))
+            ),
             "best_bound": (None if rescued_warning else _main_bound),
             "solver_status": solver.status_name(status),
             "rescued": bool(rescued_warning),
             "solver_wall_time": round(solver.wall_time, 2),
+            "used_seed": _used_seed,                             # 前端 cache best seed 用
+            "random_search": bool(random_search),
         },
     }
 
