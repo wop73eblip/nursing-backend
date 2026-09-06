@@ -1,11 +1,8 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
-import bcrypt as _bcrypt
-from jose import JWTError, jwt
 from datetime import datetime, timedelta, date as date_type
 import math, os, io
 from urllib.parse import quote
@@ -17,6 +14,15 @@ from openpyxl.styles import Font, Border, Side, Alignment, PatternFill
 
 load_dotenv()
 
+# 認證相關(SECRET_KEY / JWT / 防暴力 / role 檢查):見 auth.py
+from auth import (
+    LoginRequest, Token, AdminResetPassword, ChangePassword,
+    verify_password, get_password_hash, create_access_token,
+    get_current_user, require_roles,
+    login_key, login_is_locked, login_record_fail, login_clear,
+    LOGIN_MAX_FAILS, LOGIN_WINDOW_SEC, LOGIN_LOCK_SEC,
+)
+
 app = FastAPI(title="護理排班系統 API")
 
 app.add_middleware(
@@ -27,29 +33,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SECRET_KEY = os.getenv("SECRET_KEY", "fallback-secret-key")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 8
+from db import supabase   # supabase client 統一由 db.py 提供
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+# ── 掛載已拆出的 routers(rules / logs / game)
+from routes import rules as rules_router
+from routes import logs as logs_router
+from routes import game as game_router
+app.include_router(rules_router.router)
+app.include_router(logs_router.router)
+app.include_router(game_router.router)
 
-security = HTTPBearer()
 
-
-# ── 資料模型
-class LoginRequest(BaseModel):
-    uid: str
-    password: str
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    role: str
-    name: str
-    uid: str
-
+# ── 資料模型(auth 相關已挪至 auth.py;rules/game 相關已挪至各 route module)
 class UserCreate(BaseModel):
     uid: str
     password: str
@@ -76,89 +71,10 @@ class UserPatch(BaseModel):
     note: Optional[str] = None
     sort_order: Optional[int] = None
 
-class AdminResetPassword(BaseModel):
-    new_password: str
-
-class ChangePassword(BaseModel):
-    old_password: str
-    new_password: str
-
 class ShiftUpdate(BaseModel):
     nurse_uid: str
     date: str
     shift: Optional[str] = None
-
-class RulesUpdate(BaseModel):
-    rules: dict
-
-class GameSaveUpdate(BaseModel):
-    data: dict        # 遊戲進度（場景、旗標、道具…），整包存 jsonb
-
-class GameContentUpdate(BaseModel):
-    data: dict        # 遊戲內容（對話、道具文字…），後台編輯，整包存 jsonb
-
-class GameMessageCreate(BaseModel):
-    text: str         # 玩家在遊戲留言板送出的內容
-
-
-# ── 登入防暴力破解：同一帳號+IP 短時間內試錯太多次即暫時鎖定
-_LOGIN_FAILS: dict[str, list[float]] = {}   # key -> 失敗時間戳列表
-LOGIN_MAX_FAILS = 8            # 視窗內允許的失敗次數
-LOGIN_WINDOW_SEC = 600         # 統計視窗（10 分鐘）
-LOGIN_LOCK_SEC = 600           # 觸發後鎖定時間（10 分鐘）
-
-def _login_key(uid: str, ip: str) -> str:
-    return f"{(uid or '').strip().lower()}|{ip}"
-
-def _login_is_locked(key: str) -> int:
-    """回傳剩餘鎖定秒數（0＝未鎖定）。"""
-    import time
-    now = time.time()
-    fails = [t for t in _LOGIN_FAILS.get(key, []) if now - t < LOGIN_WINDOW_SEC]
-    _LOGIN_FAILS[key] = fails
-    if len(fails) >= LOGIN_MAX_FAILS:
-        remain = int(LOGIN_LOCK_SEC - (now - fails[-1]))
-        return max(0, remain)
-    return 0
-
-def _login_record_fail(key: str) -> None:
-    import time
-    _LOGIN_FAILS.setdefault(key, []).append(time.time())
-
-def _login_clear(key: str) -> None:
-    _LOGIN_FAILS.pop(key, None)
-
-
-# ── 工具函數
-def verify_password(plain: str, hashed: str) -> bool:
-    return _bcrypt.checkpw(plain.encode(), hashed.encode())
-
-def get_password_hash(password: str) -> str:
-    return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
-
-def create_access_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        uid = payload.get("sub")
-        if uid is None:
-            raise HTTPException(status_code=401, detail="無效的 Token")
-        return payload
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token 已過期或無效")
-
-def require_roles(*roles):
-    def checker(current_user: dict = Depends(get_current_user)):
-        if current_user.get("role") not in roles:
-            raise HTTPException(status_code=403, detail="權限不足")
-        return current_user
-    return checker
-
 
 # ── 路由
 @app.get("/")
@@ -173,10 +89,10 @@ def login(request: LoginRequest, http_request: Request):
     # 取得來源 IP（Railway 在反向代理後，優先讀 X-Forwarded-For）
     fwd = http_request.headers.get("x-forwarded-for", "")
     client_ip = (fwd.split(",")[0].strip() if fwd else (http_request.client.host if http_request.client else "unknown"))
-    rl_key = _login_key(uid_in, client_ip)
+    rl_key = login_key(uid_in, client_ip)
 
     # 防暴力破解：鎖定中直接拒絕
-    remain = _login_is_locked(rl_key)
+    remain = login_is_locked(rl_key)
     if remain > 0:
         raise HTTPException(status_code=429, detail=f"登入嘗試過於頻繁，請於 {remain // 60 + 1} 分鐘後再試")
 
@@ -186,10 +102,10 @@ def login(request: LoginRequest, http_request: Request):
     user = next((u for u in (res.data or []) if (u.get("uid") or "").lower() == uid_in.lower()), None)
 
     if not user or not verify_password(request.password, user["password_hash"]):
-        _login_record_fail(rl_key)
+        login_record_fail(rl_key)
         raise HTTPException(status_code=401, detail="喔喔!! 帳號或密碼錯了")
 
-    _login_clear(rl_key)   # 成功後清除失敗紀錄
+    login_clear(rl_key)   # 成功後清除失敗紀錄
     token = create_access_token({
         "sub": user["uid"],
         "role": user["role"],
@@ -585,178 +501,6 @@ def unconfirm_shifts(
     except Exception:
         pass
     return {"message": f"已取消確認 {len(shifts)} 筆"}
-
-
-@app.get("/rules")
-def get_rules(current_user: dict = Depends(get_current_user)):
-    res = supabase.table("rules").select("*").limit(1).execute()
-    if res.data:
-        return {"rules": res.data[0].get("data") or {}}
-    return {"rules": {}}
-
-
-@app.get("/login-config")
-def get_login_config():
-    """公開端點（登入頁未帶 token）：回傳登入畫面自訂內容，未設定則回空值由前端用預設。"""
-    res = supabase.table("rules").select("data").limit(1).execute()
-    login = {}
-    if res.data:
-        login = (res.data[0].get("data") or {}).get("login") or {}
-    return {
-        "title": login.get("title") or "",
-        "subtitle": login.get("subtitle") or "",
-        "image": login.get("image") or "",   # base64 data URI，空字串代表用預設心電圖圖示
-    }
-
-
-# 登入後首頁的模組卡片預設值（大標/小標/圖片可於後台自訂；enabled 由程式控制、非使用者可改）
-DEFAULT_MODULES = [
-    {"key": "schedule", "title": "排班系統", "tagline": "不來預班就沒得預班囉～", "enabled": True},
-    {"key": "data",     "title": "學習系統", "tagline": "護理訓練小遊戲",           "enabled": True},
-]
-
-
-@app.get("/home-config")
-def get_home_config(current_user: dict = Depends(get_current_user)):
-    """登入後首頁的模組卡片設定：合併後台自訂（大標/小標/圖片）與預設值。"""
-    res = supabase.table("rules").select("data").limit(1).execute()
-    saved: dict = {}
-    if res.data:
-        for m in ((res.data[0].get("data") or {}).get("modules") or []):
-            if m.get("key"):
-                saved[m["key"]] = m
-    modules = []
-    for d in DEFAULT_MODULES:
-        s = saved.get(d["key"], {})
-        modules.append({
-            "key": d["key"],
-            "title": s.get("title") or d["title"],
-            "tagline": s.get("tagline") or d["tagline"],
-            "image": s.get("image") or "",   # base64 data URI，空＝用預設圖示
-            "enabled": d["enabled"],
-        })
-    return {"modules": modules}
-
-
-@app.post("/rules")
-def save_rules(
-    body: RulesUpdate,
-    current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
-):
-    existing = supabase.table("rules").select("id", "data").limit(1).execute()
-    if existing.data:
-        current_data = existing.data[0].get("data") or {}
-        incoming = dict(body.rules)
-        # modules 特殊處理：依 key 合併（更新有送的、保留沒送的），
-        # 讓「排班後台」「學習系統後台」各自只送自己那張卡也不會蓋掉對方。
-        if "modules" in incoming:
-            cur = {m["key"]: m for m in (current_data.get("modules") or []) if m.get("key")}
-            for m in incoming["modules"]:
-                if m.get("key"):
-                    cur[m["key"]] = m
-            incoming["modules"] = list(cur.values())
-        merged = {**current_data, **incoming}
-        supabase.table("rules").update({
-            "data": merged,
-            "updated_at": datetime.utcnow().isoformat(),
-        }).eq("id", existing.data[0]["id"]).execute()
-    else:
-        supabase.table("rules").insert({
-            "key": "config",   # 舊欄位 NOT NULL 相容
-            "value": "{}",
-            "data": body.rules,
-        }).execute()
-    return {"message": "規則已儲存"}
-
-
-# ── 遊戲存檔：與現有帳號綁定（uid 一律由登入 token 取得，不信任前端傳來的身分）
-@app.get("/game/save")
-def get_game_save(current_user: dict = Depends(get_current_user)):
-    uid = current_user["sub"]
-    res = supabase.table("game_saves").select("data").eq("uid", uid).limit(1).execute()
-    if res.data:
-        return {"data": res.data[0].get("data")}
-    return {"data": None}   # 沒存檔＝新玩家
-
-
-@app.put("/game/save")
-def put_game_save(
-    body: GameSaveUpdate,
-    current_user: dict = Depends(get_current_user),
-):
-    uid = current_user["sub"]
-    supabase.table("game_saves").upsert({
-        "uid": uid,
-        "data": body.data,
-        "updated_at": datetime.utcnow().isoformat(),
-    }).execute()
-    return {"message": "已儲存"}
-
-
-@app.delete("/game/save")
-def delete_game_save(current_user: dict = Depends(get_current_user)):
-    uid = current_user["sub"]
-    supabase.table("game_saves").delete().eq("uid", uid).execute()
-    return {"message": "已清除"}
-
-
-# ── 遊戲內容（對話、道具文字）：後台編輯，全遊戲共用一份
-@app.get("/game/content")
-def get_game_content():
-    """公開：遊戲載入時抓最新內容。沒設定過就回空物件，遊戲會用內建預設。"""
-    res = supabase.table("game_content").select("data").eq("id", 1).limit(1).execute()
-    if res.data:
-        return {"data": res.data[0].get("data") or {}}
-    return {"data": {}}
-
-
-@app.post("/game/content")
-def save_game_content(
-    body: GameContentUpdate,
-    current_user: dict = Depends(require_roles("superadmin")),   # 遊戲後台：僅超級管理員
-):
-    supabase.table("game_content").upsert({
-        "id": 1,   # 只存一列，永遠覆蓋
-        "data": body.data,
-        "updated_at": datetime.utcnow().isoformat(),
-    }).execute()
-    return {"message": "已儲存"}
-
-
-# ── 遊戲留言板：玩家送出留言（綁登入帳號）
-@app.post("/game/messages", status_code=201)
-def post_game_message(
-    body: GameMessageCreate,
-    current_user: dict = Depends(get_current_user),
-):
-    text = (body.text or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="留言不能空白")
-    supabase.table("game_messages").insert({
-        "uid": current_user["sub"],
-        "name": current_user.get("name"),
-        "text": text[:500],   # 上限 500 字
-    }).execute()
-    return {"message": "已送出"}
-
-
-@app.get("/game/messages")
-def get_game_messages(current_user: dict = Depends(get_current_user)):
-    # 超級管理員（遊戲後台）看全部；其他人只看自己的
-    q = supabase.table("game_messages").select("id, uid, name, text, created_at")
-    if current_user.get("role") != "superadmin":
-        q = q.eq("uid", current_user["sub"])
-    res = q.order("created_at", desc=True).limit(300).execute()
-    return {"messages": res.data or []}
-
-
-@app.delete("/game/messages/{msg_id}")
-def delete_game_message(
-    msg_id: int,
-    current_user: dict = Depends(require_roles("superadmin")),   # 遊戲後台：僅超級管理員
-):
-    supabase.table("game_messages").delete().eq("id", msg_id).execute()
-    return {"message": "已刪除"}
 
 
 @app.post("/schedule/generate")
@@ -3463,23 +3207,4 @@ def purge_old_schedule(
     return {"message": f"✓ 已清除 {cutoff} 之前的班表（{len(ids)} 格）", "deleted": len(ids), "cutoff": cutoff}
 
 
-@app.get("/logs")
-def get_logs(
-    limit: int = 200,
-    current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
-):
-    res = supabase.table("shift_logs").select("*").order("created_at", desc=True).limit(limit).execute()
-    return {"logs": res.data}
-
-
-@app.delete("/logs")
-def delete_logs(
-    before_hours: Optional[int] = None,
-    current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
-):
-    if before_hours is None:
-        supabase.table("shift_logs").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-        return {"message": "已清除所有操作紀錄"}
-    cutoff = (datetime.utcnow() - timedelta(hours=before_hours)).isoformat()
-    supabase.table("shift_logs").delete().lt("created_at", cutoff).execute()
-    return {"message": f"已清除 {before_hours} 小時前的操作紀錄"}
+# /logs endpoints 已挪至 routes/logs.py
