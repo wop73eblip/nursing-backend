@@ -1,0 +1,49 @@
+name: Supabase Keepalive
+
+# 目的:每天定時打 Supabase REST API 保持 project 活躍
+# 避免免費 tier「7 天無活動」自動 pause
+#
+# 這個 workflow 在 nursing-backend repo 執行,不占用系統資源
+
+on:
+  schedule:
+    # 每天 UTC 00:00 = 台灣時間 08:00 執行
+    - cron: '0 0 * * *'
+  workflow_dispatch:    # 允許手動觸發(在 GitHub Actions 頁面點按鈕)
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase REST endpoint
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          # 做一個 SELECT 查詢確保 DB 有活動(不只 API)
+          # /rest/v1/rules?select=id&limit=1 → 讀 rules table 一筆
+          resp=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            "$SUPABASE_URL/rest/v1/rules?select=id&limit=1")
+          echo "HTTP status: $resp"
+          echo "Response body:"
+          cat /tmp/resp.json
+          # 200 = OK,401 = auth 錯,404 = table 不存在
+          # 只要不是 5xx 就算成功(Supabase 有回應)
+          if [ "$resp" -ge 500 ]; then
+            echo "❌ Supabase server error (5xx)"
+            exit 1
+          fi
+          echo "✓ Supabase alive"
+
+      - name: Ping Railway backend (順帶保持 Railway 活躍)
+        run: |
+          # Railway hobby 也可能因閒置而冷啟動;順便打一下暖著
+          resp=$(curl -sS -o /dev/null -w "%{http_code}" \
+            --max-time 30 \
+            "https://web-production-e9f2a5.up.railway.app/")
+          echo "Railway HTTP: $resp"
+          if [ "$resp" != "200" ]; then
+            echo "⚠ Railway 回應非 200,但 Supabase 已 keep alive"
+          fi
