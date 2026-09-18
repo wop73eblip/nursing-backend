@@ -1,46 +1,74 @@
 name: Supabase Keepalive
 
-# 目的:每天定時打 Supabase REST API 保持 project 活躍
-# 避免免費 tier「7 天無活動」自動 pause
+# 目的:每 6 小時做「真寫入」保 Supabase 免費 tier 不 pause
 #
-# 這個 workflow 在 nursing-backend repo 執行,不占用系統資源
+# 為什麼要真寫入而不是 SELECT?
+# Supabase 免費 tier 可能認為 SELECT 是快取讀取(不算活動),
+# 用 PATCH 更新 rules.updated_at 保證 DB 有真的 write activity。
 
 on:
   schedule:
     # 每 6 小時執行 = 台灣時間 02:00 / 08:00 / 14:00 / 20:00
-    # 避免免費 tier 因閒置被 pause(對這個 project 需要更頻繁)
     - cron: '0 0,6,12,18 * * *'
-  workflow_dispatch:    # 允許手動觸發(在 GitHub Actions 頁面點按鈕)
+  workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Supabase REST endpoint
+      - name: Write Supabase heartbeat (real DB activity)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          # 做一個 SELECT 查詢確保 DB 有活動(不只 API)
-          # /rest/v1/rules?select=id&limit=1 → 讀 rules table 一筆
-          resp=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
-            -H "apikey: $SUPABASE_ANON_KEY" \
-            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
-            "$SUPABASE_URL/rest/v1/rules?select=id&limit=1")
-          echo "HTTP status: $resp"
-          echo "Response body:"
-          cat /tmp/resp.json
-          # 200 = OK,401 = auth 錯,404 = table 不存在
-          # 只要不是 5xx 就算成功(Supabase 有回應)
-          if [ "$resp" -ge 500 ]; then
-            echo "❌ Supabase server error (5xx)"
-            exit 1
-          fi
-          echo "✓ Supabase alive"
+          python3 <<'PYEOF'
+          import os, json, urllib.request, urllib.error, sys
+          from datetime import datetime, timezone
 
-      - name: Ping Railway backend (順帶保持 Railway 活躍)
+          url = os.environ['SUPABASE_URL']
+          key = os.environ['SUPABASE_SERVICE_KEY']
+          headers = {
+              'apikey': key,
+              'Authorization': f'Bearer {key}',
+              'Content-Type': 'application/json',
+              'Prefer': 'return=minimal',
+          }
+
+          # 1. 讀 rules 拿 id
+          try:
+              req = urllib.request.Request(
+                  f"{url}/rest/v1/rules?select=id&limit=1",
+                  headers=headers,
+              )
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  rows = json.load(r)
+              if not rows:
+                  print("❌ rules table 沒有資料")
+                  sys.exit(1)
+              rid = rows[0]['id']
+              print(f"✓ 讀到 rules id={rid}")
+          except urllib.error.URLError as e:
+              print(f"❌ 讀 rules 失敗: {e}")
+              sys.exit(1)
+
+          # 2. PATCH updated_at(真寫入,Supabase 100% 認為有活動)
+          now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+          try:
+              req = urllib.request.Request(
+                  f"{url}/rest/v1/rules?id=eq.{rid}",
+                  data=json.dumps({'updated_at': now}).encode(),
+                  headers=headers,
+                  method='PATCH',
+              )
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  print(f"✅ HTTP {r.status} · rules.updated_at 已寫為 {now}")
+          except urllib.error.URLError as e:
+              print(f"❌ PATCH 失敗: {e}")
+              sys.exit(1)
+          PYEOF
+
+      - name: Ping Railway backend (順便保持活躍)
         run: |
-          # Railway hobby 也可能因閒置而冷啟動;順便打一下暖著
           resp=$(curl -sS -o /dev/null -w "%{http_code}" \
             --max-time 30 \
             "https://web-production-e9f2a5.up.railway.app/")
