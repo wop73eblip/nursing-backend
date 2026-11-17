@@ -70,6 +70,7 @@ def save_rules(
     current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
 ):
     existing = supabase.table("rules").select("id", "data").limit(1).execute()
+    final_data: dict = {}
     if existing.data:
         current_data = existing.data[0].get("data") or {}
         incoming = dict(body.rules)
@@ -86,10 +87,20 @@ def save_rules(
             "data": merged,
             "updated_at": datetime.utcnow().isoformat(),
         }).eq("id", existing.data[0]["id"]).execute()
+        final_data = merged
     else:
         supabase.table("rules").insert({
             "key": "config",
             "value": "{}",
             "data": body.rules,
         }).execute()
-    return {"message": "規則已儲存"}
+        final_data = body.rules
+    # 回傳儲存後實際的筆數,讓前端可以 verify 寫入成功
+    return {
+        "message": "規則已儲存",
+        "saved_keys": list(dict(body.rules).keys()),
+        "counts": {
+            "shift_restrictions": len(final_data.get("shift_restrictions") or []),
+            "forbidden_pairs": len(final_data.get("forbidden_pairs") or []),
+        },
+    }
