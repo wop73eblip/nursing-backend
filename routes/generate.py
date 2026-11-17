@@ -90,6 +90,12 @@ def generate_schedule(
     # 格式:[{nurse_uid, start_date, end_date, allowed_shifts:["D"]}]
     # 作用:對 (m, t) 的 WORK si 加硬約束,OFF 不受限
     _shift_restrictions_list = rules.get("shift_restrictions", []) or []
+    # 王不見王(禁止配對):兩位護理師不能同一天同一班(或同一天)
+    # 格式:[{a_uid, b_uid, mode:"same_shift"|"same_day", start_date?, end_date?}]
+    #   same_shift:同一天同一班禁止(預設,較寬鬆;不同班可以)
+    #   same_day: 同一天上班就禁止(嚴格;一個白一個大夜都不行)
+    #   start_date/end_date 可省略 → 整個週期生效
+    _forbidden_pairs_list = rules.get("forbidden_pairs", []) or []
 
     start_str = cycle.get("start_date")
     end_str   = cycle.get("end_date")
@@ -604,6 +610,36 @@ def generate_schedule(
                     model.add(sum(auto_off_win) <= weekly_max_off_auto)
 
         leave_adjust_per_m[m] = leave_adjust_days_m
+
+    # ── 王不見王(forbidden_pairs):兩位護理師不能同一天同一班(或同一天)
+    if _forbidden_pairs_list and "forbidden_pairs" not in DEBUG_SKIP:
+        _uid_to_m_fp = {nurses[_mm].get("uid"): _mm for _mm in range(M)}
+        for _p in _forbidden_pairs_list:
+            _a_uid = _p.get("a_uid")
+            _b_uid = _p.get("b_uid")
+            if not _a_uid or not _b_uid or _a_uid == _b_uid:
+                continue
+            if _a_uid not in _uid_to_m_fp or _b_uid not in _uid_to_m_fp:
+                continue
+            _ma = _uid_to_m_fp[_a_uid]
+            _mb = _uid_to_m_fp[_b_uid]
+            _mode = (_p.get("mode") or "same_shift").strip()
+            _ps = _p.get("start_date") or cycle_dates[0]
+            _pe = _p.get("end_date") or cycle_dates[-1]
+            for _t, _d in enumerate(cycle_dates):
+                if not (_ps <= _d <= _pe):
+                    continue
+                # 預填已鎖的格 → 若衝突則讓路(預填優先)
+                _a_locked = (_a_uid, _d) in existing and existing[(_a_uid, _d)].get("shift")
+                _b_locked = (_b_uid, _d) in existing and existing[(_b_uid, _d)].get("shift")
+                if _a_locked and _b_locked:
+                    continue  # 兩邊都鎖了,無從約束
+                if _mode == "same_day":
+                    # 兩人不能同一天上班:b[a][t][3] + b[b][t][3] >= 1 → 至少一個 OFF
+                    model.add(b[_ma][_t][3] + b[_mb][_t][3] >= 1)
+                else:  # same_shift(預設)
+                    for _si in (0, 1, 2):
+                        model.add(b[_ma][_t][_si] + b[_mb][_t][_si] <= 1)
 
     # ── 班別限制(shift_restrictions):某護理師某段日期若排上班只能是指定 work 班
     # 休假類(OFF/V/員/喪…)不受限;預填已鎖的格直接跳過(不覆蓋預填)
