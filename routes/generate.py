@@ -612,8 +612,10 @@ def generate_schedule(
         leave_adjust_per_m[m] = leave_adjust_days_m
 
     # ── 王不見王(forbidden_pairs):兩位護理師不能同一天同一班(或同一天)
+    print(f"[FORBIDDEN_PAIRS] 讀到 {len(_forbidden_pairs_list)} 條", flush=True)
     if _forbidden_pairs_list and "forbidden_pairs" not in DEBUG_SKIP:
         _uid_to_m_fp = {nurses[_mm].get("uid"): _mm for _mm in range(M)}
+        _fp_applied = 0
         for _p in _forbidden_pairs_list:
             _a_uid = _p.get("a_uid")
             _b_uid = _p.get("b_uid")
@@ -635,42 +637,56 @@ def generate_schedule(
                 if _a_locked and _b_locked:
                     continue  # 兩邊都鎖了,無從約束
                 if _mode == "same_day":
-                    # 兩人不能同一天上班:b[a][t][3] + b[b][t][3] >= 1 → 至少一個 OFF
                     model.add(b[_ma][_t][3] + b[_mb][_t][3] >= 1)
                 else:  # same_shift(預設)
                     for _si in (0, 1, 2):
                         model.add(b[_ma][_t][_si] + b[_mb][_t][_si] <= 1)
+            _fp_applied += 1
+            print(f"  [APPLY_PAIR] {_a_uid}(m={_ma}) ⚔ {_b_uid}(m={_mb}) mode={_mode} {_ps}~{_pe}", flush=True)
+        print(f"[FORBIDDEN_PAIRS] 套用 {_fp_applied}/{len(_forbidden_pairs_list)} 條", flush=True)
 
     # ── 班別限制(shift_restrictions):某護理師某段日期若排上班只能是指定 work 班
     # 休假類(OFF/V/員/喪…)不受限;預填已鎖的格直接跳過(不覆蓋預填)
+    print(f"[SHIFT_RESTRICTIONS] 讀到 {len(_shift_restrictions_list)} 條", flush=True)
     if _shift_restrictions_list and "shift_restrictions" not in DEBUG_SKIP:
         _uid_to_m = {nurses[_mm].get("uid"): _mm for _mm in range(M)}
+        _applied_count = 0
         for _r in _shift_restrictions_list:
             _uid = _r.get("nurse_uid")
             if _uid not in _uid_to_m:
+                print(f"  [SKIP] nurse_uid={_uid!r} 不在護理師名單", flush=True)
                 continue
             _mm = _uid_to_m[_uid]
             _s_date = _r.get("start_date")
             _e_date = _r.get("end_date")
             if not _s_date or not _e_date:
+                print(f"  [SKIP] {_uid} 缺日期 start={_s_date!r} end={_e_date!r}", flush=True)
                 continue
             _allowed = set(_r.get("allowed_shifts") or [])
             if not _allowed:
+                print(f"  [SKIP] {_uid} 無 allowed_shifts", flush=True)
                 continue
             # 轉成 si 集合(0=D, 1=E, 2=N)
             _allowed_si = {SI[s] for s in _allowed if s in SI and SI[s] < 3}
             if not _allowed_si:
-                continue  # 全部指向 OFF 或無效 code,忽略
+                print(f"  [SKIP] {_uid} allowed_shifts={_allowed} 無有效 work si", flush=True)
+                continue
+            _banned_si = {0, 1, 2} - _allowed_si
+            _cells_touched = 0
+            _cells_skipped_locked = 0
             for _t, _d in enumerate(cycle_dates):
                 if not (_s_date <= _d <= _e_date):
                     continue
                 # 預填已鎖的格跳過(預填優先)
                 if (_uid, _d) in existing and existing[(_uid, _d)].get("shift"):
+                    _cells_skipped_locked += 1
                     continue
-                # 禁止不在 _allowed_si 內的 WORK si(OFF=3 不受限)
-                for _si in (0, 1, 2):
-                    if _si not in _allowed_si:
-                        model.add(b[_mm][_t][_si] == 0)
+                for _si in _banned_si:
+                    model.add(b[_mm][_t][_si] == 0)
+                _cells_touched += 1
+            _applied_count += 1
+            print(f"  [APPLY] {_uid} m={_mm} {_s_date}~{_e_date} 只能={sorted(_allowed_si)} 禁={sorted(_banned_si)} → 影響 {_cells_touched} 天(略過 {_cells_skipped_locked} 預填格)", flush=True)
+        print(f"[SHIFT_RESTRICTIONS] 套用 {_applied_count}/{len(_shift_restrictions_list)} 條", flush=True)
 
     # ── 硬規則 1：每班每日剛好 req 人；S11/S12（每班至少 1 leader、至少 2 leader/second）為硬規則，人力不足時會 INFEASIBLE
     # 新人不算 leader/second 人力（H15）：與下方 S11/S12 constraint 排除新人一致
