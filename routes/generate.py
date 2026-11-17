@@ -1950,7 +1950,10 @@ def generate_schedule(
     # ── 人力不足警告(改用「實際計算」而不是 solver 決策變數,避免 solver FEASIBLE 時 slack_var
     # 值大於實際少休天數導致警告不準)
     warnings: list[str] = []
-    # 班別限制 / 王不見王 套用情況(放開頭讓使用者第一眼就看見)
+    # 系統規則狀態(無條件顯示一行,確定使用者可見這些規則有被讀到)
+    warnings.append(
+        f"ℹ 系統規則讀取:班別限制 {len(_shift_restrictions_list)} 條、王不見王 {len(_forbidden_pairs_list)} 條"
+    )
     if _extra_rules_diag:
         warnings.extend(_extra_rules_diag)
     if rescued_warning:
