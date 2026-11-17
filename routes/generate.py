@@ -86,6 +86,10 @@ def generate_schedule(
     # 個別護理師 attr 偏離配額(允許排非 attr 班別幾天):[{nurse_uid, days}]
     _nurse_dev_list = rules.get("nurse_deviation_overrides", []) or []
     _nurse_dev_overrides = {o["nurse_uid"]: int(o.get("days") or 0) for o in _nurse_dev_list if o.get("nurse_uid")}
+    # 班別限制(特殊情況):某護理師在某段日期若排上班只能是指定班別(例:莉莉 12/14-1/3 只能 D,帶新人)
+    # 格式:[{nurse_uid, start_date, end_date, allowed_shifts:["D"]}]
+    # 作用:對 (m, t) 的 WORK si 加硬約束,OFF 不受限
+    _shift_restrictions_list = rules.get("shift_restrictions", []) or []
 
     start_str = cycle.get("start_date")
     end_str   = cycle.get("end_date")
@@ -600,6 +604,37 @@ def generate_schedule(
                     model.add(sum(auto_off_win) <= weekly_max_off_auto)
 
         leave_adjust_per_m[m] = leave_adjust_days_m
+
+    # ── 班別限制(shift_restrictions):某護理師某段日期若排上班只能是指定 work 班
+    # 休假類(OFF/V/員/喪…)不受限;預填已鎖的格直接跳過(不覆蓋預填)
+    if _shift_restrictions_list and "shift_restrictions" not in DEBUG_SKIP:
+        _uid_to_m = {nurses[_mm].get("uid"): _mm for _mm in range(M)}
+        for _r in _shift_restrictions_list:
+            _uid = _r.get("nurse_uid")
+            if _uid not in _uid_to_m:
+                continue
+            _mm = _uid_to_m[_uid]
+            _s_date = _r.get("start_date")
+            _e_date = _r.get("end_date")
+            if not _s_date or not _e_date:
+                continue
+            _allowed = set(_r.get("allowed_shifts") or [])
+            if not _allowed:
+                continue
+            # 轉成 si 集合(0=D, 1=E, 2=N)
+            _allowed_si = {SI[s] for s in _allowed if s in SI and SI[s] < 3}
+            if not _allowed_si:
+                continue  # 全部指向 OFF 或無效 code,忽略
+            for _t, _d in enumerate(cycle_dates):
+                if not (_s_date <= _d <= _e_date):
+                    continue
+                # 預填已鎖的格跳過(預填優先)
+                if (_uid, _d) in existing and existing[(_uid, _d)].get("shift"):
+                    continue
+                # 禁止不在 _allowed_si 內的 WORK si(OFF=3 不受限)
+                for _si in (0, 1, 2):
+                    if _si not in _allowed_si:
+                        model.add(b[_mm][_t][_si] == 0)
 
     # ── 硬規則 1：每班每日剛好 req 人；S11/S12（每班至少 1 leader、至少 2 leader/second）為硬規則，人力不足時會 INFEASIBLE
     # 新人不算 leader/second 人力（H15）：與下方 S11/S12 constraint 排除新人一致
