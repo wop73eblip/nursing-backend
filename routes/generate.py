@@ -96,6 +96,8 @@ def generate_schedule(
     #   same_day: 同一天上班就禁止(嚴格;一個白一個大夜都不行)
     #   start_date/end_date 可省略 → 整個週期生效
     _forbidden_pairs_list = rules.get("forbidden_pairs", []) or []
+    # 診斷訊息:班別限制 / 王不見王 的套用情況,放進生成結果 warnings 讓使用者可見
+    _extra_rules_diag: list[str] = []
 
     start_str = cycle.get("start_date")
     end_str   = cycle.get("end_date")
@@ -642,8 +644,13 @@ def generate_schedule(
                     for _si in (0, 1, 2):
                         model.add(b[_ma][_t][_si] + b[_mb][_t][_si] <= 1)
             _fp_applied += 1
+            _a_name = nurses[_ma].get("name") or _a_uid
+            _b_name = nurses[_mb].get("name") or _b_uid
+            _extra_rules_diag.append(f"⚔ 王不見王已套用:{_a_name} X {_b_name}")
             print(f"  [APPLY_PAIR] {_a_uid}(m={_ma}) ⚔ {_b_uid}(m={_mb}) mode={_mode} {_ps}~{_pe}", flush=True)
         print(f"[FORBIDDEN_PAIRS] 套用 {_fp_applied}/{len(_forbidden_pairs_list)} 條", flush=True)
+        if _forbidden_pairs_list and _fp_applied == 0:
+            _extra_rules_diag.append(f"⚠ 王不見王讀到 {len(_forbidden_pairs_list)} 條但 0 條套用成功(檢查 nurse_uid 是否正確)")
 
     # ── 班別限制(shift_restrictions):某護理師某段日期若排上班只能是指定 work 班
     # 休假類(OFF/V/員/喪…)不受限;預填已鎖的格直接跳過(不覆蓋預填)
@@ -685,8 +692,18 @@ def generate_schedule(
                     model.add(b[_mm][_t][_si] == 0)
                 _cells_touched += 1
             _applied_count += 1
+            _n_name = nurses[_mm].get("name") or _uid
+            _allowed_codes = [c for c in ("D","E","N") if SI[c] in _allowed_si]
+            _extra_rules_diag.append(
+                f"✦ 班別限制已套用:{_n_name} {_s_date}~{_e_date} 只能排 {'/'.join(_allowed_codes)}"
+                f"(影響 {_cells_touched} 天"
+                + (f",預填優先略過 {_cells_skipped_locked} 格" if _cells_skipped_locked else "")
+                + ")"
+            )
             print(f"  [APPLY] {_uid} m={_mm} {_s_date}~{_e_date} 只能={sorted(_allowed_si)} 禁={sorted(_banned_si)} → 影響 {_cells_touched} 天(略過 {_cells_skipped_locked} 預填格)", flush=True)
         print(f"[SHIFT_RESTRICTIONS] 套用 {_applied_count}/{len(_shift_restrictions_list)} 條", flush=True)
+        if _shift_restrictions_list and _applied_count == 0:
+            _extra_rules_diag.append(f"⚠ 班別限制讀到 {len(_shift_restrictions_list)} 條但 0 條套用成功(檢查 nurse_uid 與日期)")
 
     # ── 硬規則 1：每班每日剛好 req 人；S11/S12（每班至少 1 leader、至少 2 leader/second）為硬規則，人力不足時會 INFEASIBLE
     # 新人不算 leader/second 人力（H15）：與下方 S11/S12 constraint 排除新人一致
@@ -1933,6 +1950,9 @@ def generate_schedule(
     # ── 人力不足警告(改用「實際計算」而不是 solver 決策變數,避免 solver FEASIBLE 時 slack_var
     # 值大於實際少休天數導致警告不準)
     warnings: list[str] = []
+    # 班別限制 / 王不見王 套用情況(放開頭讓使用者第一眼就看見)
+    if _extra_rules_diag:
+        warnings.extend(_extra_rules_diag)
     if rescued_warning:
         warnings.append("⚠ " + rescued_warning)
     _slack_groups: dict[int, list[str]] = {}
