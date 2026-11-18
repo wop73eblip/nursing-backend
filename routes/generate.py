@@ -979,10 +979,25 @@ def generate_schedule(
 
         # ── 軟規則：孤立上班日懲罰（OFF-上班-OFF，出來上一天班很累）
         # 半職因工作天少、密度稀,solver 常把他們排成孤立日；用倍率加重讓 solver 優先讓半職連上
+        # 跨月邊界處理:
+        #   • t=0(本月第 1 天):讀 hist_si[m][-1](上月最後一天)。若上月最後一天是 OFF,
+        #     且本月第 1 天上班、本月第 2 天 OFF → 才算孤立日。上月最後一天若上班,本月第 1
+        #     天上班是「連 2 天上班」,不算孤立日。
+        #   • t=n-1(本月最後一天):下月尚未排,無法判定。保守放過,不計入懲罰。
         ISOLATED_WORK_PENALTY = pen("ISOLATED_WORK_PENALTY", 750)
         _iso_ht_mult = pen_float("HT_ISOLATED_MULT", 2.5)
         _iso_pen_m = int(ISOLATED_WORK_PENALTY * _iso_ht_mult) if is_ht else ISOLATED_WORK_PENALTY
         _iso_vars_m: list = []
+        # t=0:用上月最後一天 (hist_si[m][-1]) 判;3 = OFF-equivalent
+        _prev_last_off = (m in hist_si) and (hist_si[m][-1] == 3)
+        if _prev_last_off and n >= 2:
+            iso0 = model.new_bool_var(f"isowork_{m}_0")
+            work_0 = sum(b[m][0][s] for s in range(3))
+            # 前一天(上月末)已是 OFF → iso0 = 1 若 當天上班 + 後一天 OFF
+            model.add(iso0 >= work_0 + b[m][1][3] - 1)
+            penalties.append(iso0 * _iso_pen_m)
+            _all_iso_vars.append(iso0)
+            _iso_vars_m.append(iso0)
         for t in range(1, n - 1):
             iso = model.new_bool_var(f"isowork_{m}_{t}")
             work_t = sum(b[m][t][s] for s in range(3))
@@ -2096,6 +2111,11 @@ def generate_schedule(
         _kinds = SHIFT_ALLOWED.get(_attr_of.get(uid, "輪班DEN"), list(_work_set))
         _ntypes = len([c for c in _kinds if c in _work_set])
         metric_excess += max(0, sw - max(0, _ntypes - 1))   # 扣掉必要換班數
+        # 孤立日:與 solver 一致。t=0 用上月最後一天判(hist OFF 才算孤立),t=n-1 不算
+        _prev_tail_seq = hist_raw_by_nurse.get(uid, ["OFF"] * HISTORY_DAYS)
+        _prev_tail_off = _prev_tail_seq[-1] in REST_CODES or _prev_tail_seq[-1] in LEAVE_ADJUST or _prev_tail_seq[-1] == "OFF"
+        if len(_seq) >= 2 and _prev_tail_off and _seq[0] != 'X' and _seq[1] == 'X':
+            metric_isolated += 1
         for i in range(1, len(_seq) - 1):
             if _seq[i] != 'X' and _seq[i-1] == 'X' and _seq[i+1] == 'X':
                 metric_isolated += 1
@@ -2125,7 +2145,10 @@ def generate_schedule(
             _l2 = sum(1 for _l in _blocks if _l == 2)
             _l34 = sum(1 for _l in _blocks if 3 <= _l <= 4)
             _l5 = sum(1 for _l in _blocks if _l >= 5)
+            # 孤立日:t=0 要看上月最後一天(OFF 才算),t=n-1 保守不算
             _iso_cnt = sum(1 for _i in range(1, _ln-1) if _seq[_i] != 'X' and _seq[_i-1] == 'X' and _seq[_i+1] == 'X')
+            if _ln >= 2 and _prev_tail_off and _seq[0] != 'X' and _seq[1] == 'X':
+                _iso_cnt += 1
             _sw_cnt = 0; _rev_cnt = 0
             _REV = {('E','D'),('N','E'),('N','D')}
             for _k in range(1, len(work_seq)):
