@@ -21,6 +21,48 @@ def get_rules(current_user: dict = Depends(get_current_user)):
     return {"rules": {}}
 
 
+class MyExtraOffUpdate(BaseModel):
+    enabled: bool
+
+
+@router.post("/my-extra-off")
+def toggle_my_extra_off(
+    body: MyExtraOffUpdate,
+    current_user: dict = Depends(require_roles("nurse", "dual", "admin", "superadmin")),
+):
+    """護理師本人開/關本期「願意多放假」(當月限定)。
+
+    enabled=True:把自己加入 extra_off_this_cycle
+    enabled=False:從名單移出
+    """
+    uid = current_user.get("uid")
+    if not uid:
+        return {"ok": False, "message": "缺少使用者 UID"}
+    res = supabase.table("rules").select("id", "data").limit(1).execute()
+    if not res.data:
+        # 建一筆新的
+        supabase.table("rules").insert({
+            "key": "config",
+            "value": "{}",
+            "data": {"extra_off_this_cycle": [uid] if body.enabled else []},
+        }).execute()
+        return {"ok": True, "enabled": body.enabled}
+    row = res.data[0]
+    data = row.get("data") or {}
+    cur_list = list(data.get("extra_off_this_cycle") or [])
+    if body.enabled:
+        if uid not in cur_list:
+            cur_list.append(uid)
+    else:
+        cur_list = [x for x in cur_list if x != uid]
+    data["extra_off_this_cycle"] = cur_list
+    supabase.table("rules").update({
+        "data": data,
+        "updated_at": datetime.utcnow().isoformat(),
+    }).eq("id", row["id"]).execute()
+    return {"ok": True, "enabled": body.enabled, "count": len(cur_list)}
+
+
 @router.get("/login-config")
 def get_login_config():
     """公開端點(登入頁未帶 token):回傳登入畫面自訂內容,未設定則回空值由前端用預設。"""

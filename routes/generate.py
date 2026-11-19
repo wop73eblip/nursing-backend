@@ -96,6 +96,10 @@ def generate_schedule(
     #   same_day: 同一天上班就禁止(嚴格;一個白一個大夜都不行)
     #   start_date/end_date 可省略 → 整個週期生效
     _forbidden_pairs_list = rules.get("forbidden_pairs", []) or []
+    # 多餘 OFF 優先分配(當月限定):本期想多放假的護理師 UID 清單
+    # 格式:["uid1", "uid2", ...]
+    # 作用:這些人的 OVER_OFF_PENALTY 大幅下調 → solver 優先把多餘 OFF 分給他們
+    _extra_off_uids: set = set(rules.get("extra_off_this_cycle") or [])
     # 診斷訊息:班別限制 / 王不見王 的套用情況,放進生成結果 warnings 讓使用者可見
     _extra_rules_diag: list[str] = []
 
@@ -442,6 +446,9 @@ def generate_schedule(
         over_off = model.new_int_var(0, n, f"over_off_{m}")
         model.add(sum(free_off) <= off_days + over_off)
         _over_off_pen = pen("OVER_OFF_PENALTY_HALF", 500) if is_ht else pen("OVER_OFF_PENALTY_FULL", 1500)
+        # 多餘 OFF 優先分配:本期想多放假的人,把罰值大幅下調 → solver 優先把多餘 OFF 塞給他
+        if nurse.get("uid") in _extra_off_uids:
+            _over_off_pen = max(50, _over_off_pen // 5)   # 1500→300、500→100
         penalties.append(over_off * _over_off_pen)
         over_off_vars.append((m, over_off))
 
@@ -1970,7 +1977,7 @@ def generate_schedule(
     warnings: list[str] = []
     # 系統規則狀態(無條件顯示一行,確定使用者可見這些規則有被讀到)
     warnings.append(
-        f"ℹ 系統規則讀取:班別限制 {len(_shift_restrictions_list)} 條、王不見王 {len(_forbidden_pairs_list)} 條"
+        f"ℹ 系統規則讀取:班別限制 {len(_shift_restrictions_list)} 條、王不見王 {len(_forbidden_pairs_list)} 條、本期多休名單 {len(_extra_off_uids)} 人"
     )
     if _extra_rules_diag:
         warnings.extend(_extra_rules_diag)
