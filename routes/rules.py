@@ -28,9 +28,13 @@ class MyExtraOffUpdate(BaseModel):
 @router.post("/my-extra-off")
 def toggle_my_extra_off(
     body: MyExtraOffUpdate,
-    current_user: dict = Depends(require_roles("nurse", "dual", "admin", "superadmin")),
+    current_user: dict = Depends(require_roles("nurse", "dual")),
 ):
     """護理師本人開/關本期「願意多放假」(當月限定)。
+
+    權限:僅限 nurse/dual 自行勾選。管理員 / 超管要幫護理師加入,
+    請走管理員介面的「🎁 多餘 OFF 分配」區(POST /rules),以免此 endpoint
+    把管理員 UID 誤寫入名單形成殘影。
 
     enabled=True:把自己加入 extra_off_this_cycle
     enabled=False:從名單移出
