@@ -35,7 +35,7 @@ def toggle_my_extra_off(
     enabled=True:把自己加入 extra_off_this_cycle
     enabled=False:從名單移出
     """
-    uid = current_user.get("uid")
+    uid = current_user.get("sub") or current_user.get("uid")
     if not uid:
         return {"ok": False, "message": "缺少使用者 UID"}
     res = supabase.table("rules").select("id", "data").limit(1).execute()
