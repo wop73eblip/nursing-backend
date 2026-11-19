@@ -84,7 +84,8 @@ def update_shift(
     if role == "nurse" and update.nurse_uid != uid:
         raise HTTPException(status_code=403, detail="只能修改自己的預班")
 
-    existing = supabase.table("shifts").select("id").eq("nurse_uid", update.nurse_uid).eq("date", update.date).execute()
+    existing = supabase.table("shifts").select("id, shift").eq("nurse_uid", update.nurse_uid).eq("date", update.date).execute()
+    before_shift = existing.data[0].get("shift") if existing.data else None
 
     if existing.data:
         supabase.table("shifts").update({
@@ -108,6 +109,7 @@ def update_shift(
         supabase.table("shift_logs").insert({
             "nurse_uid": update.nurse_uid,
             "date": update.date,
+            "before_shift": before_shift,
             "shift": update.shift,
             "changed_by": uid,
             "operator_uid": uid,
@@ -138,14 +140,17 @@ def batch_update_shifts(
 
     pairs = [(u.nurse_uid, u.date) for u in updates]
     existing_keys: set[str] = set()
+    old_shifts: dict[str, Optional[str]] = {}   # key = f"{uid}_{date}" → 原 shift
     nurse_uids = list({p[0] for p in pairs})
     min_date = min(p[1] for p in pairs)
     max_date = max(p[1] for p in pairs)
-    res = supabase.table("shifts").select("nurse_uid, date") \
+    res = supabase.table("shifts").select("nurse_uid, date, shift") \
         .in_("nurse_uid", nurse_uids) \
         .gte("date", min_date).lte("date", max_date).execute()
     for r in (res.data or []):
-        existing_keys.add(f"{r['nurse_uid']}_{r['date']}")
+        k = f"{r['nurse_uid']}_{r['date']}"
+        existing_keys.add(k)
+        old_shifts[k] = r.get("shift")
 
     to_insert, to_update_clear, to_update_set = [], [], []
     for u in updates:
@@ -186,7 +191,9 @@ def batch_update_shifts(
 
     try:
         supabase.table("shift_logs").insert([{
-            "nurse_uid": u.nurse_uid, "date": u.date, "shift": u.shift,
+            "nurse_uid": u.nurse_uid, "date": u.date,
+            "before_shift": old_shifts.get(f"{u.nurse_uid}_{u.date}"),
+            "shift": u.shift,
             "changed_by": uid, "operator_uid": uid,
             "operator_role": role, "action": "edit",
         } for u in updates]).execute()
