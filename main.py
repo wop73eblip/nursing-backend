@@ -81,12 +81,28 @@ def login(request: LoginRequest, http_request: Request):
 
     # 帳號比對：取全部使用者於程式端做「大小寫不敏感的精確比對」，
     # 避免 ilike 把 % _ 當萬用字元造成的比對漏洞（uid 表小，效能無虞）
-    res = supabase.table("users").select("uid, password_hash, role, name").execute()
+    try:
+        res = supabase.table("users").select("uid, password_hash, role, name, terminated_at").execute()
+    except Exception:
+        # 老 schema 沒 terminated_at
+        res = supabase.table("users").select("uid, password_hash, role, name").execute()
     user = next((u for u in (res.data or []) if (u.get("uid") or "").lower() == uid_in.lower()), None)
 
     if not user or not verify_password(request.password, user["password_hash"]):
         login_record_fail(rl_key)
         raise HTTPException(status_code=401, detail="喔喔!! 帳號或密碼錯了")
+
+    # 離職後封鎖登入:terminated_at < today 直接拒絕(密碼正確也不給進)
+    term_str = user.get("terminated_at")
+    if term_str:
+        from datetime import date as _date
+        try:
+            term_d = _date.fromisoformat(term_str)
+            if term_d < _date.today():
+                login_clear(rl_key)   # 清除失敗紀錄(帳號正確、僅狀態問題)
+                raise HTTPException(status_code=403, detail=f"此帳號已於 {term_str} 離職,無法登入")
+        except ValueError:
+            pass   # 日期格式異常視為無效,允許登入
 
     login_clear(rl_key)   # 成功後清除失敗紀錄
     token = create_access_token({

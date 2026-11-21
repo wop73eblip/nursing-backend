@@ -1,5 +1,6 @@
-"""護理師帳號管理:GET/POST/PATCH/DELETE /users + 密碼變更/重設 + 排序。"""
+"""護理師帳號管理:GET/POST/PATCH/DELETE /users + 密碼變更/重設 + 排序 + 離職處理。"""
 from typing import Optional, List
+from datetime import datetime, date as date_type
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -45,12 +46,18 @@ class UserPatch(BaseModel):
 def get_users(current_user: dict = Depends(get_current_user)):
     try:
         res = supabase.table("users").select(
-            "uid, name, role, level, attr, halftime, admin_staff, is_trainee, mentor_uid, note, sort_order, created_at"
+            "uid, name, role, level, attr, halftime, admin_staff, is_trainee, mentor_uid, note, sort_order, created_at, terminated_at"
         ).order("sort_order").order("created_at").execute()
     except Exception:
-        res = supabase.table("users").select(
-            "uid, name, role, level, attr, halftime, admin_staff, is_trainee, mentor_uid, note, created_at"
-        ).order("created_at").execute()
+        # 老 schema 沒有 terminated_at 時 fallback
+        try:
+            res = supabase.table("users").select(
+                "uid, name, role, level, attr, halftime, admin_staff, is_trainee, mentor_uid, note, sort_order, created_at"
+            ).order("sort_order").order("created_at").execute()
+        except Exception:
+            res = supabase.table("users").select(
+                "uid, name, role, level, attr, halftime, admin_staff, is_trainee, mentor_uid, note, created_at"
+            ).order("created_at").execute()
     return {"users": res.data}
 
 
@@ -178,3 +185,78 @@ def reorder_users(
     for i, uid in enumerate(order):
         supabase.table("users").update({"sort_order": i}).eq("uid", uid).execute()
     return {"message": "排序已更新"}
+
+
+# ─── 離職處理 ──────────────────────────────────────────────────
+class TerminateUpdate(BaseModel):
+    terminated_at: Optional[str] = None   # ISO YYYY-MM-DD;None/空字串 = 取消離職(回復在職)
+
+
+@router.post("/users/{uid}/terminate")
+def terminate_user(
+    uid: str,
+    body: TerminateUpdate,
+    current_user: dict = Depends(require_roles("admin", "superadmin", "dual")),
+):
+    """設定護理師最後上班日(terminated_at)。
+
+    行為:
+    1. 更新 users.terminated_at
+    2. 若有值:cascade delete shifts (date > terminated_at)、含已確認。每筆寫 shift_logs
+       action="terminate_cascade", before_shift=原班別, shift=None
+    3. 若 None/空:直接清除 terminated_at(取消離職,無 cascade)
+    """
+    operator_uid = current_user.get("sub")
+    operator_role = current_user.get("role")
+
+    # 驗證帳號存在
+    target_res = supabase.table("users").select("uid, name, role").eq("uid", uid).single().execute()
+    if not target_res.data:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if target_res.data.get("role") not in ("nurse", "dual"):
+        raise HTTPException(status_code=400, detail="僅能對護理師/兼職帳號設定離職日")
+
+    term_str = (body.terminated_at or "").strip() or None
+    term_date: Optional[date_type] = None
+    if term_str:
+        try:
+            term_date = date_type.fromisoformat(term_str)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期格式錯誤,應為 YYYY-MM-DD")
+
+    # 1. 更新欄位
+    supabase.table("users").update({"terminated_at": term_str}).eq("uid", uid).execute()
+
+    # 2. cascade delete(僅在設定離職日時)
+    deleted_count = 0
+    if term_date:
+        # 讀取「離職日之後」的 shifts(含已確認)
+        res = supabase.table("shifts").select("id, date, shift").eq("nurse_uid", uid) \
+            .gt("date", term_date.isoformat()).execute()
+        to_delete = res.data or []
+        deleted_count = len(to_delete)
+
+        if to_delete:
+            # 批次寫 shift_logs
+            try:
+                supabase.table("shift_logs").insert([{
+                    "nurse_uid": uid,
+                    "date": r["date"],
+                    "before_shift": r.get("shift"),
+                    "shift": None,
+                    "changed_by": operator_uid,
+                    "operator_uid": operator_uid,
+                    "operator_role": operator_role,
+                    "action": "terminate_cascade",
+                } for r in to_delete]).execute()
+            except Exception:
+                pass
+            # 刪除 shifts
+            supabase.table("shifts").delete().eq("nurse_uid", uid) \
+                .gt("date", term_date.isoformat()).execute()
+
+    return {
+        "message": "離職日已設定" if term_date else "已取消離職狀態",
+        "terminated_at": term_str,
+        "deleted_shifts": deleted_count,
+    }
