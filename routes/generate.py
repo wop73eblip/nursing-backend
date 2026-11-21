@@ -166,12 +166,51 @@ def generate_schedule(
     FIXED_SHIFT_MAP = {"固定D": 0, "固定E": 1, "固定N": 2}
 
     # ── 讀取護理師（排除行政人員：可預班但不參與生成）
-    nurses_res = supabase.table("users").select(
-        "uid, name, attr, halftime, level, admin_staff, is_trainee, mentor_uid"
-    ).in_("role", ["nurse", "dual"]).order("sort_order").execute()
+    try:
+        nurses_res = supabase.table("users").select(
+            "uid, name, attr, halftime, level, admin_staff, is_trainee, mentor_uid, terminated_at"
+        ).in_("role", ["nurse", "dual"]).order("sort_order").execute()
+    except Exception:
+        # 老 schema 沒有 terminated_at
+        nurses_res = supabase.table("users").select(
+            "uid, name, attr, halftime, level, admin_staff, is_trainee, mentor_uid"
+        ).in_("role", ["nurse", "dual"]).order("sort_order").execute()
     nurses = [n for n in (nurses_res.data or []) if not n.get("admin_staff")]
+    # 過濾:離職日在週期開始前 → 完全不列入 solver
+    nurses = [
+        n for n in nurses
+        if not n.get("terminated_at")
+        or date_type.fromisoformat(n["terminated_at"]) >= start_d
+    ]
     if not nurses:
         raise HTTPException(400, "尚無護理師帳號")
+
+    # ── 計算每位離職者在本週期的 eff_days + min_OFF/max_OFF
+    # dep_info[uid] = {eff_days, full_weeks, partial_days, min_off, max_off, term_date_idx}
+    dep_info: dict[str, dict] = {}
+    for _nu in nurses:
+        _t_str = _nu.get("terminated_at")
+        if not _t_str:
+            continue
+        try:
+            _t_date = date_type.fromisoformat(_t_str)
+        except (ValueError, TypeError):
+            continue
+        if _t_date >= end_d:
+            continue  # 整個週期都在職,不算離職者
+        _eff = (_t_date - start_d).days + 1
+        if _eff <= 0:
+            continue
+        _full = _eff // 7
+        _partial = _eff % 7
+        dep_info[_nu["uid"]] = {
+            "eff_days": _eff,
+            "full_weeks": _full,
+            "partial_days": _partial,
+            "min_off": _full * 2 + (1 if _partial == 6 else 0),
+            "max_off": _full * 2 + min(_partial, 2),
+            "term_date_idx": _eff - 1,   # 最後上班日的 t index
+        }
     M = len(nurses)
     nid = {n["uid"]: i for i, n in enumerate(nurses)}
     # 新人：照排班規則排、但不計臨床人數（S1/S11/S12 排除）；有導師則軟性跟隨其班
@@ -329,6 +368,22 @@ def generate_schedule(
         exception_days_m: dict[int, int] = {}   # 屬性衝突的預填格 t→si（跳過允許班種限制）
         nurse_name = nurse.get("name") or uid
 
+        # ── 離職者:鎖定 t >= eff_days 為 OFF,並標記為 terminated_days_m
+        # terminated_days_m 跟 leave_adjust_days_m 類似:不計入應休配額、不佔週 OFF 上限
+        terminated_days_m: set[int] = set()
+        _dep = dep_info.get(uid)
+        if _dep:
+            _eff = _dep["eff_days"]
+            for _t in range(_eff, n):
+                model.add(b[m][_t][3] == 1)   # 鎖 OFF
+                terminated_days_m.add(_t)
+            # partial = 6 強制 1 OFF(例假不可省):在 partial 6 天內至少 1 OFF
+            if _dep["partial_days"] == 6:
+                _partial_start = _dep["full_weeks"] * 7
+                _partial_days = list(range(_partial_start, _eff))   # eff_days 不含,所以 [start, eff)
+                if _partial_days:
+                    model.add(sum(b[m][_t][3] for _t in _partial_days) >= 1)
+
         for t, d_str in enumerate(cycle_dates):
             key = (uid, d_str)
             if "locks" in DEBUG_SKIP or key not in existing:
@@ -427,14 +482,21 @@ def generate_schedule(
 
         # ── 休假天數（LEAVE_ADJUST 不計入應休名額）
         la_count = len(leave_adjust_days_m)
-        guaranteed_off = part_off if is_ht else full_off
-        off_days = guaranteed_off  # 全職用 full_off，半職用 part_off
-        off_days = max(0, min(off_days, n - la_count - 1))
+        # 離職者:採用對照表動態 quota(eff_days → min_off/max_off),SLACK=0 不允許少於 min_off
+        if _dep:
+            off_days = _dep["min_off"]        # 下限(硬規則來自 1 例 1 休 + partial 6)
+            off_upper = _dep["max_off"]       # 上限(超過罰 OVER_OFF_PENALTY)
+            _slack_max = 0                    # 離職者不允許 slack
+        else:
+            guaranteed_off = part_off if is_ht else full_off
+            off_days = guaranteed_off  # 全職用 full_off，半職用 part_off
+            off_days = max(0, min(off_days, n - la_count - 1))
+            off_upper = off_days
+            _slack_max = max(0, pen("SLACK_MAX_PER_NURSE", 2))   # 每人少休上限(人力吃緊時可拉高至 5-7)
 
-        # 應休 OFF（排除 LEAVE_ADJUST）
-        free_off = [b[m][t][3] for t in range(n) if t not in leave_adjust_days_m]
-        # 軟規則 E：人力不足時允許縮減應休天數（off_slack，最多 -2 天）
-        _slack_max = max(0, pen("SLACK_MAX_PER_NURSE", 2))   # 每人少休上限(人力吃緊時可拉高至 5-7)
+        # 應休 OFF（排除 LEAVE_ADJUST + 離職者的鎖定 OFF）
+        free_off = [b[m][t][3] for t in range(n) if t not in leave_adjust_days_m and t not in terminated_days_m]
+        # 軟規則 E：人力不足時允許縮減應休天數（off_slack，最多 -2 天;離職者 =0）
         off_slack = model.new_int_var(0, _slack_max, f"off_slack_{m}")
         # 半職使用 slack 罰更重(讓 solver 優先填滿半職 quota,而非用 slack)
         _slack_pen_m = pen("SLACK_PENALTY_HALF", 1000) if is_ht else pen("SLACK_PENALTY_FULL", 200)
@@ -444,7 +506,7 @@ def generate_schedule(
         # 超出應休天數的部分用高懲罰軟約束取代硬上限，避免供需差造成 INFEASIBLE
         # 全職過休比半職貴 → 讓 solver 優先把多餘 OFF 分給半職(填滿他們 quota),而非全職
         over_off = model.new_int_var(0, n, f"over_off_{m}")
-        model.add(sum(free_off) <= off_days + over_off)
+        model.add(sum(free_off) <= off_upper + over_off)
         _over_off_pen = pen("OVER_OFF_PENALTY_HALF", 500) if is_ht else pen("OVER_OFF_PENALTY_FULL", 1500)
         # 多餘 OFF 優先分配:本期想多放假的人,把罰值大幅下調 → solver 優先把多餘 OFF 塞給他
         if nurse.get("uid") in _extra_off_uids:
@@ -479,10 +541,19 @@ def generate_schedule(
                 _imply_zero(bx(m, t, 2), b[m][t+2][0])
 
         # ── 硬規則 3：每週至少一天應休（OFF 或半），LEAVE_ADJUST（V、員、喪⋯）不計入
+        # 離職者:terminated_days_m 也排除(鎖定 OFF 不算進週應休)
+        # partial=6 強制 1 OFF 的規則已在上方單獨處理,此處全跳過該部分週
         for wi, (ws, we) in enumerate(weeks):
             week_range = list(range(ws, we + 1))
+            # 本週是否完全在離職日之後?若是,跳過(整週鎖 OFF,無需規則)
+            if _dep and all(t in terminated_days_m for t in week_range):
+                continue
+            # 本週是否跨離職日(partial week)?若是,跳過每週應休規則
+            # (partial=6 已單獨加硬規則;partial<6 無需強制;partial=7 = 完整在職週才套)
+            if _dep and any(t in terminated_days_m for t in week_range):
+                continue
             # 僅計算非 LEAVE_ADJUST 的天（LEAVE_ADJUST 不算應休）
-            rest_eligible = [t for t in week_range if t not in leave_adjust_days_m]
+            rest_eligible = [t for t in week_range if t not in leave_adjust_days_m and t not in terminated_days_m]
             if not rest_eligible:
                 continue  # 整週都是 LEAVE_ADJUST，跳過
             # 計算本週「可自由調整」的天（非確認上班且非第一天鎖定上班）
@@ -594,6 +665,9 @@ def generate_schedule(
         if not is_ht and "rule7" not in DEBUG_SKIP:
             for t in range(n - weekly_max_off_total):
                 if any((t + k) in leave_adjust_days_m for k in range(weekly_max_off_total + 1)):
+                    continue
+                # 離職者:視窗內包含 terminated_days(鎖 OFF)→ 跳過此限制(視同連休既成事實)
+                if any((t + k) in terminated_days_m for k in range(weekly_max_off_total + 1)):
                     continue
                 # 若視窗內已鎖定的 OFF 超過上限（既成事實），跳過此限制
                 locked_off_in_win = sum(
@@ -799,11 +873,14 @@ def generate_schedule(
     for _, slack_var, _spen in off_slack_vars:
         penalties.append(slack_var * _spen)
     # 軟規則 E：off_slack 公平分配，懲罰最大與最小差距（避免集中同一人）
-    if off_slack_vars:
+    # 離職者排除:他們 slack=0 固定,不應參與公平性比較
+    _non_term_slack_vars = [(m_i, sv, p) for (m_i, sv, p) in off_slack_vars
+                            if nurses[m_i].get("uid") not in dep_info]
+    if _non_term_slack_vars:
         _sk_ub = max(0, pen("SLACK_MAX_PER_NURSE", 2))
         _max_sk = model.new_int_var(0, _sk_ub, "max_off_slack")
         _min_sk = model.new_int_var(0, _sk_ub, "min_off_slack")
-        for _, sv, _ in off_slack_vars:
+        for _, sv, _ in _non_term_slack_vars:
             model.add(_max_sk >= sv)
             model.add(_min_sk <= sv)
         _sk_spread = model.new_int_var(0, _sk_ub, "slack_spread")
@@ -811,12 +888,13 @@ def generate_schedule(
         _SK_SPREAD_BASE = pen("SKILL_SPREAD_PENALTY", 400)
         penalties.append(_sk_spread * int(_SK_SPREAD_BASE * FAIR_MULT))
         # 方案 C:實驗性硬約束 slack 差 ≤ N(default 0=關;1=強制大家 slack 最多差 1 天)
+        # 離職者已排除在集合外
         _slack_hard_cap = pen("SLACK_SPREAD_HARD_CAP", 0)
         if _slack_hard_cap > 0:
             _a_sk_hard = model.new_bool_var("a_slack_spread_hard")
             model.add(_max_sk - _min_sk <= _slack_hard_cap).only_enforce_if(_a_sk_hard)
             assume_reg.append((_a_sk_hard, f"slack 差 ≤ {_slack_hard_cap}(SLACK_SPREAD_HARD_CAP)"))
-            print(f"[SLACK-HARD] 硬約束啟用:max_slack - min_slack ≤ {_slack_hard_cap}")
+            print(f"[SLACK-HARD] 硬約束啟用(排除 {len(dep_info)} 位離職者):max_slack - min_slack ≤ {_slack_hard_cap}")
     # leader/second 軟約束懲罰(注意:loop 變數不能叫 pen,會 shadow 全域 pen() 函式!)
     for miss_var, _pen_val in leader_miss_vars:
         penalties.append(miss_var * _pen_val)
@@ -964,7 +1042,11 @@ def generate_schedule(
             _pc = [0, 0, 0]
         else:
             _pc = _pc_raw
-        if attr == "輪班DE":
+        # 離職者:H7/H14 比例硬上限跳過(樣本數太少,比例無意義,且會造成 INFEASIBLE)
+        _is_departing = nurses[m].get("uid") in dep_info
+        if _is_departing:
+            print(f"[RATIO] {nurse_name} 離職者,跳過比例檢查(H7/H14)")
+        elif attr == "輪班DE":
             _rd, _re = _r("de_d","D"), _r("de_e","E")
             print(f"[RATIO] {nurse_name} attr={attr} D:E = {_rd}:{_re}")
             _add_pair_penalty(_total_d, _rd, _total_e, _re, f"de_{m}", _locked_cnt[0], _locked_cnt[1], _pc[0], _pc[1])
@@ -1142,6 +1224,12 @@ def generate_schedule(
         if _all_seg_starts_this_m and not _is_ht_here and fixed_si is None:
             _allowed = SHIFT_ALLOWED.get(attr, ["D","E","N"])
             _seg_hard_cap = pen("SEG_HARD_CAP_3", 6) if len(_allowed) >= 3 else pen("SEG_HARD_CAP_2", 5)
+            # 離職者:按 eff_days/n 比例縮(ceil),避免樣本少反而被誤判超段
+            _dep_here = dep_info.get(nurses[m]["uid"])
+            if _dep_here and _seg_hard_cap > 0:
+                _orig_cap = _seg_hard_cap
+                _seg_hard_cap = math.ceil(_seg_hard_cap * _dep_here["eff_days"] / n)
+                print(f"[S11] {_nurse_name_here} 離職者,段數上限按比例縮:{_orig_cap} → {_seg_hard_cap} (eff_days={_dep_here['eff_days']}/{n})")
             if _seg_hard_cap > 0:   # 0 = 關掉硬規則
                 _a_seg = model.new_bool_var(f"a_seg_hard_{m}")
                 model.add(sum(_all_seg_starts_this_m) <= _seg_hard_cap).only_enforce_if(_a_seg)
@@ -2113,6 +2201,10 @@ def generate_schedule(
     metric_isolated = 0
     metric_max_dev = 0
     for uid, sched in schedules.items():
+        # 離職者:只統計 eff_days 內(切短 sched)
+        _dep_m = dep_info.get(uid)
+        if _dep_m:
+            sched = sched[:_dep_m["eff_days"]]
         # 序列:D/E/N 保留、行政視同 D、其他(OFF/半/LA)標 X
         _seq = ['D' if s in _admin_set else (s if s in _work_set else 'X') for s in sched]
         work_seq = [s for s in _seq if s != 'X']
