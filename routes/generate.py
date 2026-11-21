@@ -1919,7 +1919,12 @@ def generate_schedule(
         # timeout(UNKNOWN)時列出容易誤導使用者(這些預班已由例外日機制處理,並非失敗主因)
         _truly_infeasible = bool(core_labels) or diag_status == cp_model.INFEASIBLE or status == cp_model.INFEASIBLE
         if prefill_conflicts and _truly_infeasible:
-            detail += "\n\n⚠ 以下預班／已確認資料與規則不符，嚴格規則下常是排不出的主因，建議先修正：\n" + "\n".join(prefill_conflicts)
+            detail += (
+                "\n\n💡 以下預填班別與輪班屬性不符,系統已由【例外日機制】接受(不影響該格本身),"
+                "但集中出現時會擠壓其他規則空間(如 H4 每週≤2 種班、比例上限、連 6 等),"
+                "若本次排不出可優先考慮改成屬性相符的班別、改用「班別限制」功能,或調整輪班屬性:\n"
+                + "\n".join(prefill_conflicts)
+            )
         elif prefill_conflicts:
             # timeout 情境:只提示存在但不強調是主因
             detail += "\n\n💡 提示:以下預班有屬性衝突已由例外日機制處理,不是本次失敗主因;調整可讓班表更整齊:\n" + "\n".join(prefill_conflicts[:3]) + (f"\n(另有 {len(prefill_conflicts)-3} 項)" if len(prefill_conflicts) > 3 else "")
