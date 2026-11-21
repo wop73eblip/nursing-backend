@@ -224,20 +224,34 @@ def terminate_user(
         except ValueError:
             raise HTTPException(status_code=400, detail="日期格式錯誤,應為 YYYY-MM-DD")
 
-    # 1. 更新欄位
-    supabase.table("users").update({"terminated_at": term_str}).eq("uid", uid).execute()
+    # 1. 更新 terminated_at 欄位
+    try:
+        supabase.table("users").update({"terminated_at": term_str}).eq("uid", uid).execute()
+    except Exception as e:
+        # 常見原因:column 不存在。提示用戶執行 SQL
+        err_msg = str(e)
+        if "terminated_at" in err_msg.lower() or "column" in err_msg.lower():
+            raise HTTPException(
+                status_code=500,
+                detail="users 表缺少 terminated_at 欄位。請在 Supabase SQL Editor 執行: ALTER TABLE users ADD COLUMN terminated_at DATE;"
+            )
+        raise HTTPException(status_code=500, detail=f"更新失敗: {err_msg[:200]}")
 
     # 2. cascade delete(僅在設定離職日時)
     deleted_count = 0
+    log_error: Optional[str] = None
     if term_date:
-        # 讀取「離職日之後」的 shifts(含已確認)
-        res = supabase.table("shifts").select("id, date, shift").eq("nurse_uid", uid) \
-            .gt("date", term_date.isoformat()).execute()
-        to_delete = res.data or []
-        deleted_count = len(to_delete)
+        try:
+            # 讀取「離職日之後」的 shifts(含已確認)
+            res = supabase.table("shifts").select("id, date, shift").eq("nurse_uid", uid) \
+                .gt("date", term_date.isoformat()).execute()
+            to_delete = res.data or []
+            deleted_count = len(to_delete)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"讀取 shifts 失敗: {str(e)[:200]}")
 
         if to_delete:
-            # 批次寫 shift_logs
+            # 批次寫 shift_logs(失敗不致命,因可能缺 before_shift 欄位)
             try:
                 supabase.table("shift_logs").insert([{
                     "nurse_uid": uid,
@@ -249,14 +263,18 @@ def terminate_user(
                     "operator_role": operator_role,
                     "action": "terminate_cascade",
                 } for r in to_delete]).execute()
-            except Exception:
-                pass
+            except Exception as e:
+                log_error = str(e)[:150]
             # 刪除 shifts
-            supabase.table("shifts").delete().eq("nurse_uid", uid) \
-                .gt("date", term_date.isoformat()).execute()
+            try:
+                supabase.table("shifts").delete().eq("nurse_uid", uid) \
+                    .gt("date", term_date.isoformat()).execute()
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"刪除 shifts 失敗: {str(e)[:200]}")
 
     return {
         "message": "離職日已設定" if term_date else "已取消離職狀態",
         "terminated_at": term_str,
         "deleted_shifts": deleted_count,
+        "log_warning": log_error,   # 若有 log 寫入失敗(非致命),回傳供前端提示
     }
