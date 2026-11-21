@@ -388,6 +388,9 @@ def generate_schedule(
             key = (uid, d_str)
             if "locks" in DEBUG_SKIP or key not in existing:
                 continue
+            # 離職者:離職日之後的天數一律忽略預填(即使 DB 殘留,也被 terminated_days_m 鎖 OFF 覆蓋)
+            if t in terminated_days_m:
+                continue
             row = existing[key]
             # shift 為空（被清除的殘留列）→ 視為空白格，不鎖定
             if not row.get("shift"):
@@ -1087,7 +1090,9 @@ def generate_schedule(
             penalties.append(iso0 * _iso_pen_m)
             _all_iso_vars.append(iso0)
             _iso_vars_m.append(iso0)
-        for t in range(1, n - 1):
+        # 離職者:只掃 eff_days 內(避免離職日後的鎖 OFF 造成「最後上班日前一天」被誤判孤立)
+        _iso_t_upper = (dep_info.get(uid, {}).get("eff_days") or n) - 1 if uid in dep_info else n - 1
+        for t in range(1, _iso_t_upper):
             iso = model.new_bool_var(f"isowork_{m}_{t}")
             work_t = sum(b[m][t][s] for s in range(3))
             # iso = 1 若 前一天OFF + 當天上班 + 後一天OFF
@@ -1224,13 +1229,11 @@ def generate_schedule(
         if _all_seg_starts_this_m and not _is_ht_here and fixed_si is None:
             _allowed = SHIFT_ALLOWED.get(attr, ["D","E","N"])
             _seg_hard_cap = pen("SEG_HARD_CAP_3", 6) if len(_allowed) >= 3 else pen("SEG_HARD_CAP_2", 5)
-            # 離職者:按 eff_days/n 比例縮(ceil),避免樣本少反而被誤判超段
+            # 離職者:完全跳過 S11(樣本數小,段數比例縮容易過嚴反而 INFEASIBLE)
             _dep_here = dep_info.get(nurses[m]["uid"])
-            if _dep_here and _seg_hard_cap > 0:
-                _orig_cap = _seg_hard_cap
-                _seg_hard_cap = math.ceil(_seg_hard_cap * _dep_here["eff_days"] / n)
-                print(f"[S11] {_nurse_name_here} 離職者,段數上限按比例縮:{_orig_cap} → {_seg_hard_cap} (eff_days={_dep_here['eff_days']}/{n})")
-            if _seg_hard_cap > 0:   # 0 = 關掉硬規則
+            if _dep_here:
+                print(f"[S11] {_nurse_name_here} 離職者,跳過段數上限(eff_days={_dep_here['eff_days']}/{n})")
+            elif _seg_hard_cap > 0:   # 0 = 關掉硬規則
                 _a_seg = model.new_bool_var(f"a_seg_hard_{m}")
                 model.add(sum(_all_seg_starts_this_m) <= _seg_hard_cap).only_enforce_if(_a_seg)
                 assume_reg.append((_a_seg, f"{attr}班種段數加總 ≤ {_seg_hard_cap} — {_nurse_name_here}"))
