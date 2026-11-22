@@ -922,6 +922,26 @@ def generate_schedule(
             model.add(_max_sk - _min_sk <= _slack_hard_cap).only_enforce_if(_a_sk_hard)
             assume_reg.append((_a_sk_hard, f"slack 差 ≤ {_slack_hard_cap}(SLACK_SPREAD_HARD_CAP)"))
             print(f"[SLACK-HARD] 硬約束啟用(排除 {len(dep_info)} 位離職者):max_slack - min_slack ≤ {_slack_hard_cap}")
+
+    # ── 人力過剩時平均多放:over 差 ≤ N 硬約束(鏡像 SLACK_SPREAD_HARD_CAP)
+    # 排除「多餘 OFF 分配」名單人(他們本來就是要多放,不受公平限制)
+    # 也排除離職者(terminated_days_m 鎖 OFF,不算公平比較對象)
+    _over_hard_cap = pen("OVER_SPREAD_HARD_CAP", 0)
+    if _over_hard_cap > 0 and over_off_vars:
+        _non_excl_overs = [ov for (m_i, ov) in over_off_vars
+                           if nurses[m_i].get("uid") not in _extra_off_uids
+                           and nurses[m_i].get("uid") not in dep_info]
+        if len(_non_excl_overs) >= 2:
+            _max_ov = model.new_int_var(0, n, "max_over_off")
+            _min_ov = model.new_int_var(0, n, "min_over_off")
+            for _ov in _non_excl_overs:
+                model.add(_max_ov >= _ov)
+                model.add(_min_ov <= _ov)
+            _a_ov_hard = model.new_bool_var("a_over_spread_hard")
+            model.add(_max_ov - _min_ov <= _over_hard_cap).only_enforce_if(_a_ov_hard)
+            assume_reg.append((_a_ov_hard, f"over 差 ≤ {_over_hard_cap}(OVER_SPREAD_HARD_CAP,排除名單人+離職者)"))
+            print(f"[OVER-HARD] 硬約束啟用(排除 {len(_extra_off_uids)} 位名單人、{len(dep_info)} 位離職者):max_over - min_over ≤ {_over_hard_cap}")
+
     # leader/second 軟約束懲罰(注意:loop 變數不能叫 pen,會 shadow 全域 pen() 函式!)
     for miss_var, _pen_val in leader_miss_vars:
         penalties.append(miss_var * _pen_val)
