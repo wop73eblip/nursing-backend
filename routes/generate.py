@@ -616,10 +616,11 @@ def generate_schedule(
             if "rule4" not in DEBUG_SKIP:
                 model.add(has_D + has_E + has_N <= 2)
 
-        # ── 連續上班類+LA 上限:視窗 max_consec+1 天內,(D+E+N) + LA ≤ max_consec,
-        # 等同「連續 max_consec 天內若全是工作類或 LA,下一天必須真 OFF 斷開」。
-        # 用戶需求(2026-11):V V V V V V V → 不行;OFF V V V V V OFF → OK。
-        # 歷史 LA 從 hist_raw_by_nurse 原始代碼判斷(hist_si 已把 LA 轉成 3 遺失此資訊)。
+        # ── 連續上班上限(H9):視窗 max_consec+1 天內,工作 (D/E/N) ≤ max_consec
+        # 可選擴充(scheduling.include_la_in_consec 預設 False):LA 也算連續
+        # 啟用時:連續「上班類+LA」≤ max_consec,一旦達到必須有真 OFF 斷開
+        # 注意:啟用會讓 solver 變慢明顯。
+        _include_la_consec = bool(scheduling.get("include_la_in_consec", False))
         _hist_raw = hist_raw_by_nurse.get(uid, ["OFF"] * HISTORY_DAYS)
         def _is_hist_la(hist_idx: int) -> int:
             if 0 <= hist_idx < HISTORY_DAYS:
@@ -628,23 +629,24 @@ def generate_schedule(
         if "consec" not in DEBUG_SKIP:
             for t in range(-max_consec, n - max_consec):
                 decision_terms = []
-                const_sum = 0   # hist work + hist LA + decision LA(鎖定常數)
+                hist_sum = 0
+                la_add = 0
                 for k in range(max_consec + 1):
                     _tt = t + k
-                    # 工作類 D/E/N
                     for s in range(3):
                         val = bx(m, _tt, s)
                         if isinstance(val, int):
-                            const_sum += val
+                            hist_sum += val
                         else:
                             decision_terms.append(val)
-                    # LA 加成:視窗內的 LA 天算 1
-                    if _tt < 0:
-                        const_sum += _is_hist_la(_tt + HISTORY_DAYS)
-                    elif _tt in leave_adjust_days_m:
-                        const_sum += 1
+                    if _include_la_consec:
+                        if _tt < 0:
+                            la_add += _is_hist_la(_tt + HISTORY_DAYS)
+                        elif _tt in leave_adjust_days_m:
+                            la_add += 1
                 if decision_terms:
-                    model.add(sum(decision_terms) + const_sum <= max_consec)
+                    cap = max(0, max_consec - hist_sum - la_add)
+                    model.add(sum(decision_terms) <= cap)
 
         # ── 一例一休（S3）：硬規則（上方 rest 區塊 week_rest_sum >= 2），此處不重複強制
 
@@ -1448,10 +1450,16 @@ def generate_schedule(
                         msg = f"【反向班預填】{name} {cycle_dates[t]}(N)→{cycle_dates[t+2]}(D) 之間應隔 2 天 OFF（目前只隔 1 天）"
                         pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
 
-    # 診斷 5:連續 上班類+LA 預填超標(只掃本次週期內,不含歷史)
-    # 計算連續「工作類(D/E/N + 行政班) + LA(V/員/喪/延休/補休/調移)」,只有 OFF/半 才斷開
+    # 診斷 5:連續上班預填超標(只掃本次週期內,不含歷史)
+    # 當 scheduling.include_la_in_consec = True 時,LA 也算入連續
+    _include_la_diag = bool(scheduling.get("include_la_in_consec", False))
     if max_consec > 0 and "consec_diag" not in DEBUG_SKIP:
-        REST_ONLY = REST_CODES | {"OFF"}   # 真 OFF/半 才算斷開(LA 不算)
+        if _include_la_diag:
+            REST_SET = REST_CODES | {"OFF"}
+            LABEL = "連續上班類+LA 超標"
+        else:
+            REST_SET = REST_CODES | LEAVE_ADJUST | {"OFF"}
+            LABEL = "連續上班超標"
         for m in range(M):
             uid = nurses[m]["uid"]
             name = nurses[m].get("name") or uid
@@ -1462,18 +1470,16 @@ def generate_schedule(
                 r = existing.get((uid, cycle_dates[t]))
                 sh = (r.get("shift") if r else None)
                 if not sh:
-                    # 未鎖定的格,連續狀態中斷(solver 有彈性可放 OFF)
                     run = 0; run_start_label = None
                     continue
-                if sh in REST_ONLY:
+                if sh in REST_SET:
                     run = 0; run_start_label = None
                 else:
-                    # 工作類 D/E/N/行政 + LA 都算入連續
                     if run == 0:
                         run_start_label = cycle_dates[t]
                     run += 1
                     if run > max_consec and not reported:
-                        msg = f"【連續上班類+LA 超標】{name} 從 {run_start_label} 起已預填 {run} 天連續工作/LA,超過上限 {max_consec} 天,請在其中插入 OFF 或半"
+                        msg = f"【{LABEL}】{name} 從 {run_start_label} 起已預填 {run} 天,超過上限 {max_consec} 天"
                         pre_conflicts.append(msg); print(f"[CONFLICT] {msg}")
                         reported = True
 
