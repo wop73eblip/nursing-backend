@@ -2157,33 +2157,99 @@ def generate_schedule(
     if _extra_off_uids:
         _extra_lines: list[str] = []
         _nurse_uids_in_solver = {n["uid"] for n in nurses}
+        # 工具函式:計算某人的詳細狀態
+        def _nurse_detail(mi: int) -> dict:
+            n_ = nurses[mi]
+            la_set = leave_adjust_per_m.get(mi, set())
+            actual_off = sum(1 for _t in range(n) if _xval(mi, _t) == 3 and _t not in la_set)
+            is_ht = bool(n_.get("halftime"))
+            quota = max(0, min(part_off if is_ht else full_off, n - len(la_set) - 1))
+            attr = n_.get("attr", "?")
+            lvl = n_.get("level", "")
+            # 預填工作鎖定格數(從 locked_si_counts_per_m 或 x value 推算)
+            pre_work = len(locked_si_counts_per_m.get(mi, [0, 0, 0]))
+            pre_work_days = sum(locked_si_counts_per_m.get(mi, [0, 0, 0]))
+            # 她能上的班(從 attr 推)
+            allowed_shifts = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
+            # 是不是某人的導師?
+            is_mentor = n_["uid"] in {nurses[t].get("mentor_uid") for t in trainee_set}
+            return {
+                "name": n_.get("name") or n_["uid"],
+                "actual_off": actual_off,
+                "quota": quota,
+                "over": max(0, actual_off - quota),
+                "attr": attr,
+                "level": lvl,
+                "is_ht": is_ht,
+                "is_dep": n_["uid"] in dep_info,
+                "pre_work_days": pre_work_days,
+                "allowed_shifts": allowed_shifts,
+                "is_mentor": is_mentor,
+            }
+        # 先算所有 leader 在各班的補位人數(S11 每班 ≥1 leader 的供給)
+        _all_leaders = [i for i, nx in enumerate(nurses) if nx.get("level") == "leader" and i not in trainee_set]
+        _leader_cap_per_shift = {}
+        for si, sh in enumerate(["D", "E", "N"]):
+            _leader_cap_per_shift[sh] = len([
+                i for i in _all_leaders
+                if sh in SHIFT_ALLOWED.get(nurses[i].get("attr", "?"), WORK_SHIFTS)
+            ])
         for _uid in _extra_off_uids:
-            # 1. UID 比對不到 solver 內的 nurse?
             if _uid not in _nurse_uids_in_solver:
-                _extra_lines.append(f"❌ {_uid}:名單 UID 不在 solver 內(可能已刪帳號/被 admin_staff 排除/UID 大小寫錯)")
+                _extra_lines.append(f"❌ {_uid}:名單 UID 不在 solver 內")
                 continue
-            # 2. 找到 solver 內的 nurse,算實際結果
-            _mi = next(i for i, n in enumerate(nurses) if n["uid"] == _uid)
-            _n = nurses[_mi]
-            _nm = _n.get("name") or _uid
-            _la_set_e = leave_adjust_per_m.get(_mi, set())
-            _actual_free_off = sum(1 for _t in range(n) if _xval(_mi, _t) == 3 and _t not in _la_set_e)
-            _is_ht_e = bool(_n.get("halftime"))
-            _guaranteed_e = part_off if _is_ht_e else full_off
-            _la_cnt_e = len(_la_set_e)
-            _quota_e = max(0, min(_guaranteed_e, n - _la_cnt_e - 1))
-            _over_e = max(0, _actual_free_off - _quota_e)
-            _attr = _n.get("attr", "?")
+            _mi = next(i for i, nx in enumerate(nurses) if nx["uid"] == _uid)
+            d = _nurse_detail(_mi)
             _tags = []
-            if _is_ht_e: _tags.append("半職")
-            if _n.get("level") == "leader": _tags.append("leader")
-            if _attr.startswith("固定"): _tags.append(_attr)
-            if _n.get("uid") in dep_info: _tags.append("離職")
+            if d["is_ht"]: _tags.append("半職")
+            if d["level"] == "leader": _tags.append("leader")
+            elif d["level"] == "second": _tags.append("second")
+            if d["attr"].startswith("固定"): _tags.append(d["attr"])
+            if d["is_dep"]: _tags.append("離職")
+            if d["is_mentor"]: _tags.append("導師")
             _tag_s = f"[{'/'.join(_tags)}]" if _tags else ""
-            if _over_e > 0:
-                _extra_lines.append(f"✅ {_nm}{_tag_s}:應休 {_quota_e}、實際 {_actual_free_off}、**多拿 {_over_e} 天** ← 功能生效")
+            # 她能上的班別中,leader 補位人數
+            _cap_detail = "、".join(f"{sh}{_leader_cap_per_shift.get(sh, 0)}人" for sh in d["allowed_shifts"])
+            if d["over"] > 0:
+                _extra_lines.append(
+                    f"✅ {d['name']}{_tag_s}:應休 {d['quota']}、實際 {d['actual_off']}、**多拿 {d['over']} 天** ← 功能生效"
+                )
             else:
-                _extra_lines.append(f"⚠ {_nm}{_tag_s}:應休 {_quota_e}、實際 {_actual_free_off}、多拿 0 天 ← 未生效(可能屬性限制/預填塞滿/其他人更優)")
+                _reasons = []
+                if d["level"] == "leader":
+                    _reasons.append(f"leader 補位(可覆蓋她{_cap_detail}班)")
+                if d["pre_work_days"] > 0:
+                    _reasons.append(f"預填已鎖 {d['pre_work_days']} 格工作")
+                if d["is_mentor"]:
+                    _reasons.append("她是導師(軟約束跟隨新人)")
+                if d["attr"].startswith("固定"):
+                    _reasons.append(f"固定班 {d['attr']} 只能上 1 種班")
+                _reason_s = "、".join(_reasons) if _reasons else "penalty 不夠強或其他人更優"
+                _extra_lines.append(
+                    f"⚠ {d['name']}{_tag_s}:應休 {d['quota']}、實際 {d['actual_off']}、多拿 0 天 ← 未生效\n      卡點:{_reason_s}"
+                )
+        # 對照組:實際 over > 0 的前 5 人(不管在不在名單),讓使用者看誰拿走了 OFF
+        _all_over_rows: list[tuple[int, int, dict]] = []   # (over_days, mi, detail)
+        for _mi_row, _ov_var in over_off_vars:
+            _ov_val = solver.value(_ov_var)
+            if _ov_val > 0:
+                _all_over_rows.append((_ov_val, _mi_row, _nurse_detail(_mi_row)))
+        _all_over_rows.sort(key=lambda x: -x[0])
+        if _all_over_rows:
+            _cmp_lines = []
+            for _ov, _mi_row, d2 in _all_over_rows[:5]:
+                _tags2 = []
+                if d2["is_ht"]: _tags2.append("半職")
+                if d2["level"] == "leader": _tags2.append("leader")
+                elif d2["level"] == "second": _tags2.append("second")
+                if d2["attr"].startswith("固定"): _tags2.append(d2["attr"])
+                _cap2 = "、".join(f"{sh}{_leader_cap_per_shift.get(sh, 0)}人" for sh in d2["allowed_shifts"])
+                _in_list = " ★名單人" if nurses[_mi_row]["uid"] in _extra_off_uids else ""
+                _cmp_lines.append(
+                    f"{d2['name']}[{'/'.join(_tags2) or '-'}]{_in_list}:多拿 {_ov} 天"
+                    f"(預填 {d2['pre_work_days']} 格、leader 補位 {_cap2})"
+                )
+            _extra_lines.append("──── 📊 實際多拿 OFF 前 5 名對照 ────\n      " + "\n      ".join(_cmp_lines))
         warnings.append("🎁 多餘 OFF 分配結果:\n  " + "\n  ".join(_extra_lines))
     if rescued_warning:
         warnings.append("⚠ " + rescued_warning)
