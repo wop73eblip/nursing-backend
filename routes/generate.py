@@ -594,12 +594,18 @@ def generate_schedule(
                 # （V/病/喪等 LEAVE_ADJUST 已排除在 week_rest_sum 外），或國定假日（計入應休總額、
                 # 可落在任一週，此時該週容許 3 且僅罰最小值）。半職不套用（應休天數較多，另有邏輯）。
                 if not is_ht:
-                    # 凸性懲罰（門檻 2/3/4 各罰一次）→ 邊際成本遞增：某週第 3 天 OFF 罰 1 份、
-                    # 第 4 天再多罰、第 5 天更多… 逼每週 OFF 平均分布（要 3 都 3，不要某週爆 4/5），
-                    # 且盡量壓回每週 2。人力過剩導致的多餘 OFF 無法消除，但會平均攤開。
+                    # 凸性懲罰：門檻動態=ceil(off_days / 週數),邊際成本遞增 → 逼每週 OFF 平均分布。
+                    # 固定門檻 2 的舊公式會在高 quota(如 28 天 10 OFF、4 週 → 必然某週 ≥3)時產生
+                    # 「系統性必罰」,讓 solver 無法消除下界,反而扭曲分佈。改成動態門檻:
+                    #   off_days=8 、週數=4 → 期望 2、門檻從 2 起算(同舊行為)
+                    #   off_days=10、週數=4 → 期望 2.5、門檻從 3 起算(週 3 OFF 不罰、週 4 才罰)
+                    #   off_days=13、週數=4 → 期望 3.25、門檻從 4 起算(週 4 OFF 不罰)
                     # 名單人(多餘OFF分配):凸罰也打 1/5 → 讓他能連續多拿 OFF 不被週凸罰擋回去
                     _wk_pen = max(50, WEEKLY_OFF_OVER_PENALTY // 5) if _in_extra_off_list else WEEKLY_OFF_OVER_PENALTY
-                    for _th in (2, 3, 4):
+                    _num_weeks = max(1, len(weeks))
+                    _th_base = max(2, math.ceil(off_days / _num_weeks))
+                    for _th_offset in range(3):
+                        _th = _th_base + _th_offset
                         _ov = model.new_int_var(0, len(rest_eligible), f"wkov_{m}_{wi}_{_th}")
                         model.add(_ov >= week_rest_sum - _th)
                         penalties.append(_ov * _wk_pen)
