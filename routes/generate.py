@@ -1913,8 +1913,24 @@ def generate_schedule(
                     _ldr_lines.append(f"    {_sn[si]}: leader {_nl} 人 · leader+second {_ns} 人{_mark}")
             _ldr_block = "\n".join(_ldr_lines) if _ldr_lines else "    (無需求)"
 
+            # 離職者資訊附加到失敗訊息(幫助用戶確認 solver 是否感知到)
+            _term_block = ""
+            if dep_info:
+                _term_lines = []
+                for _uid, _info in dep_info.items():
+                    _nm = next((x.get("name") for x in nurses if x["uid"] == _uid), _uid)
+                    _term_lines.append(
+                        f"    {_nm}:eff_days={_info['eff_days']}、min_off={_info['min_off']}、max_off={_info['max_off']}"
+                    )
+                _term_block = (
+                    f"\n🚪 離職者處理({len(dep_info)} 人):\n"
+                    + "\n".join(_term_lines)
+                    + "\n    (離職日之後鎖 OFF、H7/H14/S11 跳過、OFF quota 用對照表)\n"
+                )
+
             detail = (
                 "⚠ 無法生成班表,但系統無法定位到明確的單一衝突點。可能原因分三大類:\n\n"
+                + _term_block +
                 "🔴 A. 人力不足(較常見)\n"
                 f"  · 每班每日人數(S1):臨床 {M - len(trainee_set)} 人(不含新人),每日總需求 D+E+N = {sum([daily_d, daily_e, daily_n])} 人\n"
                 f"  · Leader/資深供給量(H7/H8):以下數字為「屬性允許上此班」的人數上限(供給),不是每日需求。硬規則是「每日至少 1 leader、每日至少 2 leader+second」:\n"
@@ -2089,6 +2105,15 @@ def generate_schedule(
     warnings.append(
         f"ℹ 系統規則讀取:班別限制 {len(_shift_restrictions_list)} 條、王不見王 {len(_forbidden_pairs_list)} 條、本期多休名單 {len(_extra_off_uids)} 人"
     )
+    # 離職者狀態診斷(無論成功失敗都顯示,幫助診斷)
+    if dep_info:
+        _dep_lines = []
+        for _uid, _info in dep_info.items():
+            _nm = next((x.get("name") for x in nurses if x["uid"] == _uid), _uid)
+            _dep_lines.append(
+                f"{_nm}:eff_days={_info['eff_days']}, min_off={_info['min_off']}, max_off={_info['max_off']}"
+            )
+        warnings.append(f"ℹ 離職者處理:{len(dep_info)} 人(" + "; ".join(_dep_lines) + ")")
     if _extra_rules_diag:
         warnings.extend(_extra_rules_diag)
     if rescued_warning:
