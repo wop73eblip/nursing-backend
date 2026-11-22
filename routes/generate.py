@@ -2153,6 +2153,38 @@ def generate_schedule(
         warnings.append(f"ℹ 離職者處理:{len(dep_info)} 人(" + "; ".join(_dep_lines) + ")")
     if _extra_rules_diag:
         warnings.extend(_extra_rules_diag)
+    # ── 多餘 OFF 分配名單:每人實際結果診斷(為什麼沒多拿 OFF?一眼看出)
+    if _extra_off_uids:
+        _extra_lines: list[str] = []
+        _nurse_uids_in_solver = {n["uid"] for n in nurses}
+        for _uid in _extra_off_uids:
+            # 1. UID 比對不到 solver 內的 nurse?
+            if _uid not in _nurse_uids_in_solver:
+                _extra_lines.append(f"❌ {_uid}:名單 UID 不在 solver 內(可能已刪帳號/被 admin_staff 排除/UID 大小寫錯)")
+                continue
+            # 2. 找到 solver 內的 nurse,算實際結果
+            _mi = next(i for i, n in enumerate(nurses) if n["uid"] == _uid)
+            _n = nurses[_mi]
+            _nm = _n.get("name") or _uid
+            _la_set_e = leave_adjust_per_m.get(_mi, set())
+            _actual_free_off = sum(1 for _t in range(n) if _xval(_mi, _t) == 3 and _t not in _la_set_e)
+            _is_ht_e = bool(_n.get("halftime"))
+            _guaranteed_e = part_off if _is_ht_e else full_off
+            _la_cnt_e = len(_la_set_e)
+            _quota_e = max(0, min(_guaranteed_e, n - _la_cnt_e - 1))
+            _over_e = max(0, _actual_free_off - _quota_e)
+            _attr = _n.get("attr", "?")
+            _tags = []
+            if _is_ht_e: _tags.append("半職")
+            if _n.get("level") == "leader": _tags.append("leader")
+            if _attr.startswith("固定"): _tags.append(_attr)
+            if _n.get("uid") in dep_info: _tags.append("離職")
+            _tag_s = f"[{'/'.join(_tags)}]" if _tags else ""
+            if _over_e > 0:
+                _extra_lines.append(f"✅ {_nm}{_tag_s}:應休 {_quota_e}、實際 {_actual_free_off}、**多拿 {_over_e} 天** ← 功能生效")
+            else:
+                _extra_lines.append(f"⚠ {_nm}{_tag_s}:應休 {_quota_e}、實際 {_actual_free_off}、多拿 0 天 ← 未生效(可能屬性限制/預填塞滿/其他人更優)")
+        warnings.append("🎁 多餘 OFF 分配結果:\n  " + "\n  ".join(_extra_lines))
     if rescued_warning:
         warnings.append("⚠ " + rescued_warning)
     _slack_groups: dict[int, list[str]] = {}
