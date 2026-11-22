@@ -512,8 +512,11 @@ def generate_schedule(
         model.add(sum(free_off) <= off_upper + over_off)
         _over_off_pen = pen("OVER_OFF_PENALTY_HALF", 500) if is_ht else pen("OVER_OFF_PENALTY_FULL", 1500)
         # 多餘 OFF 優先分配:本期想多放假的人,把罰值大幅下調 → solver 優先把多餘 OFF 塞給他
-        if nurse.get("uid") in _extra_off_uids:
-            _over_off_pen = max(50, _over_off_pen // 5)   # 1500→300、500→100
+        # 注意:週 OFF 凸罰(WEEKLY_OFF_OVER_PENALTY)在同人塞多天時會快速累積,
+        # 單降 over_off 不夠,下方(每週凸罰迴圈)也會對名單人打折 → 雙管齊下
+        _in_extra_off_list = nurse.get("uid") in _extra_off_uids
+        if _in_extra_off_list:
+            _over_off_pen = max(10, _over_off_pen // 20)   # 1500→75、500→25
         penalties.append(over_off * _over_off_pen)
         over_off_vars.append((m, over_off))
 
@@ -594,10 +597,12 @@ def generate_schedule(
                     # 凸性懲罰（門檻 2/3/4 各罰一次）→ 邊際成本遞增：某週第 3 天 OFF 罰 1 份、
                     # 第 4 天再多罰、第 5 天更多… 逼每週 OFF 平均分布（要 3 都 3，不要某週爆 4/5），
                     # 且盡量壓回每週 2。人力過剩導致的多餘 OFF 無法消除，但會平均攤開。
+                    # 名單人(多餘OFF分配):凸罰也打 1/5 → 讓他能連續多拿 OFF 不被週凸罰擋回去
+                    _wk_pen = max(50, WEEKLY_OFF_OVER_PENALTY // 5) if _in_extra_off_list else WEEKLY_OFF_OVER_PENALTY
                     for _th in (2, 3, 4):
                         _ov = model.new_int_var(0, len(rest_eligible), f"wkov_{m}_{wi}_{_th}")
                         model.add(_ov >= week_rest_sum - _th)
-                        penalties.append(_ov * WEEKLY_OFF_OVER_PENALTY)
+                        penalties.append(_ov * _wk_pen)
             # 否則整週鎖滿上班 → 跳過約束（異常偵測會在生成後標示警告）
 
         # ── 硬規則 4：每週 D/E/N 至多兩種班別（絕對硬性，不放寬）
