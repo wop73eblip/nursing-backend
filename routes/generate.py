@@ -942,6 +942,20 @@ def generate_schedule(
             assume_reg.append((_a_ov_hard, f"over 差 ≤ {_over_hard_cap}(OVER_SPREAD_HARD_CAP,排除名單人+離職者)"))
             print(f"[OVER-HARD] 硬約束啟用(排除 {len(_extra_off_uids)} 位名單人、{len(dep_info)} 位離職者):max_over - min_over ≤ {_over_hard_cap}")
 
+    # ── 多餘 OFF 名單人「至少多拿 N 天 OFF」硬約束(模擬測試)
+    # 繞過 solver 的 cost tradeoff,強制名單人至少 over_off ≥ N
+    # 預設 N=1,若人力真的擠不出來會顯示 INFEASIBLE 原因
+    if over_off_vars and _extra_off_uids:
+        _extra_off_min = pen("EXTRA_OFF_MIN_DAYS", 1)
+        if _extra_off_min > 0:
+            for (m_i, ov) in over_off_vars:
+                if nurses[m_i].get("uid") in _extra_off_uids:
+                    _nname = nurses[m_i].get("name") or nurses[m_i].get("uid")
+                    _a_eo = model.new_bool_var(f"a_extra_off_min_{m_i}")
+                    model.add(ov >= _extra_off_min).only_enforce_if(_a_eo)
+                    assume_reg.append((_a_eo, f"{_nname} 至少多拿 {_extra_off_min} 天 OFF(多餘OFF名單硬約束)"))
+            print(f"[EXTRA-OFF-HARD] 名單人 over_off ≥ {_extra_off_min} 硬約束啟用({len(_extra_off_uids)} 位)")
+
     # leader/second 軟約束懲罰(注意:loop 變數不能叫 pen,會 shadow 全域 pen() 函式!)
     for miss_var, _pen_val in leader_miss_vars:
         penalties.append(miss_var * _pen_val)
