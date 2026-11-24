@@ -87,14 +87,38 @@ def _build_matrix_excel(
         _i = wend + 1
     NW = len(weeks)
 
-    # 右側統計欄位位置
-    d_col = 2 + ND
-    e_col = 3 + ND
-    n_col = 4 + ND
-    week_cols = [5 + ND + w for w in range(NW)]   # 每週 OFF 欄
-    last_col = 4 + ND + NW
+    # 名單按 level 分組排序(Excel 匯出用,不動系統 sort_order):
+    #   資深(leader+second) → 半資深(third) → 一般(member) → 新人 → 行政
+    # 排序後下方「資深/半資深/總數」公式可以用連續列範圍 COUNTIF
+    def _group_key(nr):
+        if nr.get("admin_staff"): return 4
+        lv = nr.get("level")
+        if lv in ("leader", "second"): return 0
+        if lv == "third": return 1
+        if nr.get("is_trainee"): return 3
+        return 2
+    nurse_rows = sorted(nurse_rows, key=_group_key)
 
-    # 資深護理師（leader / second）；半資深（third）年資夠但白班還不算資深,E/N 班可補資深位
+    # 計算每組連續列範圍(Excel row index,從 3 起算)
+    groups_range: dict[int, list[int]] = {}
+    _ri_scan = 3
+    for _nr in nurse_rows:
+        _gk = _group_key(_nr)
+        if _gk not in groups_range:
+            groups_range[_gk] = [_ri_scan, _ri_scan]
+        else:
+            groups_range[_gk][1] = _ri_scan
+        _ri_scan += 1
+
+    # 右側統計欄位位置:班表後空一欄(gap_col),再接統計(符合用戶樣本)
+    gap_col = 2 + ND            # 空欄,不寫資料
+    d_col = 3 + ND
+    e_col = 4 + ND
+    n_col = 5 + ND
+    week_cols = [6 + ND + w for w in range(NW)]   # 每週 OFF 欄
+    last_col = 5 + ND + NW
+
+    # 資深/半資深 uid 集合(仍用於某些檢查,如標黃判斷)
     senior_uids = {nr["uid"] for nr in nurse_rows if nr.get("level") in ("leader", "second")}
     half_senior_uids = {nr["uid"] for nr in nurse_rows if nr.get("level") == "third"}
 
@@ -126,17 +150,15 @@ def _build_matrix_excel(
 
     # 護理師列
     ri = 3
+    _row_col_start = openpyxl.utils.get_column_letter(2)        # B
+    _row_col_end   = openpyxl.utils.get_column_letter(1 + ND)   # 班表最後一欄
     for nr in nurse_rows:
         name_cell = ws.cell(row=ri, column=1, value=nr["name"])
         name_cell.font = norm_font
         name_cell.alignment = center
         name_cell.border = thin
-        dcnt = ecnt = ncnt = 0
         for ci, d_str in enumerate(cycle_dates, 2):
             shift = nr["shifts"].get(d_str, "")
-            if shift == "D": dcnt += 1
-            elif shift == "E": ecnt += 1
-            elif shift == "N": ncnt += 1
             cell = ws.cell(row=ri, column=ci, value=shift)
             cell.alignment = center
             cell.border = thin
@@ -147,60 +169,83 @@ def _build_matrix_excel(
                 cell.fill = fill_special
             elif ci in weekend_cols:
                 cell.fill = fill_weekend
-        # 右側：D/E/N 天數
-        for col, val in ((d_col, dcnt), (e_col, ecnt), (n_col, ncnt)):
-            c = ws.cell(row=ri, column=col, value=val)
+        # 右側:D/E/N 天數(公式,班別 cell 改動時即時更新)
+        for col, sname in ((d_col, "D"), (e_col, "E"), (n_col, "N")):
+            formula = f'=COUNTIF({_row_col_start}{ri}:{_row_col_end}{ri},"{sname}")'
+            c = ws.cell(row=ri, column=col, value=formula)
             c.alignment = center; c.border = thin; c.font = bold_font
-        # 右側：每週 OFF 天數
+        # 右側:每週 OFF 天數(含「半」班 → COUNTIF(OFF)+COUNTIF(半))
         for w, (a, b) in enumerate(weeks):
-            woff = sum(1 for k in range(a, b + 1) if nr["shifts"].get(cycle_dates[k]) in rest_codes)
-            c = ws.cell(row=ri, column=week_cols[w], value=woff)
+            _wa = openpyxl.utils.get_column_letter(2 + a)
+            _wb = openpyxl.utils.get_column_letter(2 + b)
+            formula = (f'=COUNTIF({_wa}{ri}:{_wb}{ri},"OFF")'
+                       f'+COUNTIF({_wa}{ri}:{_wb}{ri},"半")')
+            c = ws.cell(row=ri, column=week_cols[w], value=formula)
             c.alignment = center; c.border = thin; c.font = bold_font
         ri += 1
 
-    # ── 底部區塊①：各班資深人數（每日）— 資深 = leader + second
+    # ── 底部區塊①:D/E/N 資深人數(每日,公式) — 範圍 = 資深 group 的連續列
     ri += 1
+    _senior_r = groups_range.get(0)   # [start_row, end_row] or None
     for sname in ("D", "E", "N"):
         label = ws.cell(row=ri, column=1, value=f"{sname} 資深")
         label.font = bold_font; label.alignment = center; label.border = thin; label.fill = fill_header
         for ci, d_str in enumerate(cycle_dates, 2):
-            # 新人和行政人員不計入資深臨床帶班統計
-            cnt = sum(1 for nr in nurse_rows
-                      if nr["uid"] in senior_uids
-                      and not nr.get("is_trainee") and not nr.get("admin_staff")
-                      and nr["shifts"].get(d_str) == sname)
-            c = ws.cell(row=ri, column=ci, value=cnt)
+            if _senior_r:
+                _col = openpyxl.utils.get_column_letter(ci)
+                c = ws.cell(row=ri, column=ci,
+                            value=f'=COUNTIF({_col}{_senior_r[0]}:{_col}{_senior_r[1]},"{sname}")')
+            else:
+                c = ws.cell(row=ri, column=ci, value=0)
             c.alignment = center; c.border = thin; c.font = norm_font
             if ci in weekend_cols: c.fill = fill_weekend
         ri += 1
 
-    # ── 底部區塊②：各班半資深人數（每日）— 半資深 = third（白班還不算資深,E/N 可補資深位）
+    # ── 底部區塊②:D/E/N 半資深(third)人數(每日,公式)
+    _half_r = groups_range.get(1)
     for sname in ("D", "E", "N"):
         label = ws.cell(row=ri, column=1, value=f"{sname} 半資深")
         label.font = bold_font; label.alignment = center; label.border = thin; label.fill = fill_header
         for ci, d_str in enumerate(cycle_dates, 2):
-            cnt = sum(1 for nr in nurse_rows
-                      if nr["uid"] in half_senior_uids
-                      and not nr.get("is_trainee") and not nr.get("admin_staff")
-                      and nr["shifts"].get(d_str) == sname)
-            c = ws.cell(row=ri, column=ci, value=cnt)
+            if _half_r:
+                _col = openpyxl.utils.get_column_letter(ci)
+                c = ws.cell(row=ri, column=ci,
+                            value=f'=COUNTIF({_col}{_half_r[0]}:{_col}{_half_r[1]},"{sname}")')
+            else:
+                c = ws.cell(row=ri, column=ci, value=0)
             c.alignment = center; c.border = thin; c.font = norm_font
             if ci in weekend_cols: c.fill = fill_weekend
         ri += 1
 
-    # ── 底部區塊③：各班總人數（每日，人數不足標黃；新人和行政人員不計入）
+    # ── 底部區塊③:D/E/N 總數(每日,公式;新人和行政不計入,所以範圍= group 0+1+2 連續列)
+    _total_start = None
+    _total_end = None
+    for _g in (0, 1, 2):
+        if _g in groups_range:
+            if _total_start is None:
+                _total_start = groups_range[_g][0]
+            _total_end = groups_range[_g][1]
     for si, sname in enumerate(("D", "E", "N")):
         label = ws.cell(row=ri, column=1, value=f"{sname} 總數")
         label.font = bold_font; label.alignment = center; label.border = thin
         for ci, d_str in enumerate(cycle_dates, 2):
-            cnt = sum(1 for nr in nurse_rows
-                      if not nr.get("is_trainee") and not nr.get("admin_staff")
-                      and nr["shifts"].get(d_str) == sname)
-            cell = ws.cell(row=ri, column=ci, value=cnt)
+            if _total_start is not None:
+                _col = openpyxl.utils.get_column_letter(ci)
+                cell = ws.cell(row=ri, column=ci,
+                               value=f'=COUNTIF({_col}{_total_start}:{_col}{_total_end},"{sname}")')
+            else:
+                cell = ws.cell(row=ri, column=ci, value=0)
             cell.alignment = center; cell.border = thin; cell.font = norm_font
+            # 標黃判斷(公式本身無法計值,用 python 重算一次只為上色)
             req = demand.get(d_str, (0, 0, 0))[si] if demand else None
-            if req is not None and cnt < req:
-                cell.fill = fill_short
+            if req is not None:
+                cnt_py = sum(1 for nr in nurse_rows
+                             if not nr.get("is_trainee") and not nr.get("admin_staff")
+                             and nr["shifts"].get(d_str) == sname)
+                if cnt_py < req:
+                    cell.fill = fill_short
+                elif ci in weekend_cols:
+                    cell.fill = fill_weekend
             elif ci in weekend_cols:
                 cell.fill = fill_weekend
         ri += 1
@@ -235,7 +280,7 @@ def export_preview(
     shift_defs = rules.get("shifts", {})
     rest_codes = {s["code"] for s in shift_defs.get("rest", []) if s.get("code")} or {"OFF", "半"}
 
-    users_res = supabase.table("users").select("uid, name, level").in_("role", ["nurse", "dual"]).order("sort_order").execute()
+    users_res = supabase.table("users").select("uid, name, level, is_trainee, admin_staff").in_("role", ["nurse", "dual"]).order("sort_order").execute()
 
     shifts_res = supabase.table("shifts").select("nurse_uid, date, shift") \
         .gte("date", start_str).lte("date", end_str).order("date").execute()
@@ -249,7 +294,12 @@ def export_preview(
         shift_map.setdefault(r["nurse_uid"], {})[r["date"]] = r["shift"]
         manual_keys.add(f"{r['nurse_uid']}_{r['date']}")  # 預假匯出：全部都是人工填寫
     nurse_rows = [
-        {"uid": u["uid"], "name": u["name"], "level": u.get("level"), "shifts": shift_map.get(u["uid"], {})}
+        {
+            "uid": u["uid"], "name": u["name"], "level": u.get("level"),
+            "is_trainee": u.get("is_trainee", False),
+            "admin_staff": u.get("admin_staff", False),
+            "shifts": shift_map.get(u["uid"], {}),
+        }
         for u in (users_res.data or [])
     ]
 
@@ -283,7 +333,7 @@ def export_schedule(
     # 人工填寫的格子 = 不在 last_generated_keys 裡的格子
     generated_keys = set(rules.get("last_generated_keys", []))
 
-    users_res = supabase.table("users").select("uid, name, level").in_("role", ["nurse", "dual"]).order("sort_order").execute()
+    users_res = supabase.table("users").select("uid, name, level, is_trainee, admin_staff").in_("role", ["nurse", "dual"]).order("sort_order").execute()
 
     shifts_res = supabase.table("shifts").select("nurse_uid, date, shift") \
         .gte("date", start_str).lte("date", end_str).order("date").execute()
@@ -299,7 +349,12 @@ def export_schedule(
             manual_keys.add(key)  # 人工預填（非系統生成）→ 淡黃底
         shift_map.setdefault(r["nurse_uid"], {})[r["date"]] = r["shift"]
     nurse_rows = [
-        {"uid": u["uid"], "name": u["name"], "level": u.get("level"), "shifts": shift_map.get(u["uid"], {})}
+        {
+            "uid": u["uid"], "name": u["name"], "level": u.get("level"),
+            "is_trainee": u.get("is_trainee", False),
+            "admin_staff": u.get("admin_staff", False),
+            "shifts": shift_map.get(u["uid"], {}),
+        }
         for u in (users_res.data or [])
     ]
 
