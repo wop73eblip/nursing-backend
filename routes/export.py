@@ -94,8 +94,9 @@ def _build_matrix_excel(
     week_cols = [5 + ND + w for w in range(NW)]   # 每週 OFF 欄
     last_col = 4 + ND + NW
 
-    # 資深護理師（leader / second）
+    # 資深護理師（leader / second）；半資深（third）年資夠但白班還不算資深,E/N 班可補資深位
     senior_uids = {nr["uid"] for nr in nurse_rows if nr.get("level") in ("leader", "second")}
+    half_senior_uids = {nr["uid"] for nr in nurse_rows if nr.get("level") == "third"}
 
     # Row1：日期（數字）、Row2：星期
     dow_zh = ["一", "二", "三", "四", "五", "六", "日"]
@@ -157,7 +158,7 @@ def _build_matrix_excel(
             c.alignment = center; c.border = thin; c.font = bold_font
         ri += 1
 
-    # ── 底部區塊①：各班 leader+second 人數（每日）
+    # ── 底部區塊①：各班資深人數（每日）— 資深 = leader + second
     ri += 1
     for sname in ("D", "E", "N"):
         label = ws.cell(row=ri, column=1, value=f"{sname} 資深")
@@ -173,7 +174,21 @@ def _build_matrix_excel(
             if ci in weekend_cols: c.fill = fill_weekend
         ri += 1
 
-    # ── 底部區塊②：各班總人數（每日，人數不足標黃；新人和行政人員不計入）
+    # ── 底部區塊②：各班半資深人數（每日）— 半資深 = third（白班還不算資深,E/N 可補資深位）
+    for sname in ("D", "E", "N"):
+        label = ws.cell(row=ri, column=1, value=f"{sname} 半資深")
+        label.font = bold_font; label.alignment = center; label.border = thin; label.fill = fill_header
+        for ci, d_str in enumerate(cycle_dates, 2):
+            cnt = sum(1 for nr in nurse_rows
+                      if nr["uid"] in half_senior_uids
+                      and not nr.get("is_trainee") and not nr.get("admin_staff")
+                      and nr["shifts"].get(d_str) == sname)
+            c = ws.cell(row=ri, column=ci, value=cnt)
+            c.alignment = center; c.border = thin; c.font = norm_font
+            if ci in weekend_cols: c.fill = fill_weekend
+        ri += 1
+
+    # ── 底部區塊③：各班總人數（每日，人數不足標黃；新人和行政人員不計入）
     for si, sname in enumerate(("D", "E", "N")):
         label = ws.cell(row=ri, column=1, value=f"{sname} 總數")
         label.font = bold_font; label.alignment = center; label.border = thin

@@ -816,7 +816,11 @@ def generate_schedule(
     # ── 硬規則 1：每班每日剛好 req 人；S11/S12（每班至少 1 leader、至少 2 leader/second）為硬規則，人力不足時會 INFEASIBLE
     # 新人不算 leader/second 人力（H15）：與下方 S11/S12 constraint 排除新人一致
     leaders = [i for i, n in enumerate(nurses) if n.get("level") == "leader" and i not in trainee_set]
-    seconds = [i for i, n in enumerate(nurses) if n.get("level") in ("leader", "second") and i not in trainee_set]
+    # 白班「資深」:leader + second(third 白班還不算資深);夜班(E/N)「資深」:leader + second + third
+    seconds_d  = [i for i, n in enumerate(nurses) if n.get("level") in ("leader", "second") and i not in trainee_set]
+    seconds_en = [i for i, n in enumerate(nurses) if n.get("level") in ("leader", "second", "third") and i not in trainee_set]
+    # 兼容舊代碼別名(預設採白班版本,僅供診斷訊息引用)
+    seconds = seconds_d
 
     SHIFT_ALLOWED_MAP = {
         "固定D": ["D"], "固定E": ["E"], "固定N": ["N"],
@@ -828,8 +832,10 @@ def generate_schedule(
         si: [m for m in leaders if _WORK_SHIFTS_LIST[si] in SHIFT_ALLOWED_MAP.get(nurses[m].get("attr") or "輪班DEN", _WORK_SHIFTS_LIST)]
         for si in range(3)
     }
+    # 各班「資深」池:D(si=0) 用 leader+second、E/N(si=1,2) 用 leader+second+third
+    _seniors_by_si = {0: seconds_d, 1: seconds_en, 2: seconds_en}
     _capable_seconds = {
-        si: [m for m in seconds if _WORK_SHIFTS_LIST[si] in SHIFT_ALLOWED_MAP.get(nurses[m].get("attr") or "輪班DEN", _WORK_SHIFTS_LIST)]
+        si: [m for m in _seniors_by_si[si] if _WORK_SHIFTS_LIST[si] in SHIFT_ALLOWED_MAP.get(nurses[m].get("attr") or "輪班DEN", _WORK_SHIFTS_LIST)]
         for si in range(3)
     }
     # 硬約束（人力不足時會導致 INFEASIBLE，於下方失敗診斷會提示 leader/second 不足）：
@@ -879,7 +885,8 @@ def generate_schedule(
                 _terms12 = [b[m][t][si] for m in cs if (m, t) not in admin_cells and m not in trainee_set]
                 _a_s12 = model.new_bool_var(f"a_s12_{t}_{si}")
                 model.add(sum(_terms12) >= target_s).only_enforce_if(_a_s12)
-                assume_reg.append((_a_s12, f"{_snames_diag[si]}至少{target_s}位leader/second（不含行政班）— {cycle_dates[t]}"))
+                _s12_label = "leader/second" if si == 0 else "leader/second/third"
+                assume_reg.append((_a_s12, f"{_snames_diag[si]}至少{target_s}位{_s12_label}（不含行政班）— {cycle_dates[t]}"))
     # ── 新人跟隨導師（軟性）：新人每天盡量與導師同班；新人自己的預班/請假已鎖為硬、
     #    每週剛好2休等規則照常。衝突時求解器彈性偏離幾天（用戶確認做法A：新人自己的休算進其2天週休）。
     # 診斷：印出 mentor_of 對應（協助 debug「新人沒跟老師」問題）
@@ -1940,7 +1947,9 @@ def generate_schedule(
             elif n_leader == 1:
                 violations.append(f"{_snames[si]}只有 1 位可上此班的 leader，硬性要求他每天在班，扣掉輪休後幾乎不可能（建議增加 leader 或放寬）")
             if n_second < 2:
-                violations.append(f"{_snames[si]}可上此班的 leader/second 不足 2 位（目前 {n_second} 位），無法滿足『每班至少 2 位 leader/second』硬規則")
+                _s2_label = "leader/second" if si == 0 else "leader/second/third"
+                _s2_rule  = "白班每日至少 2 位 leader/second" if si == 0 else "夜班每日至少 2 位 leader/second/third"
+                violations.append(f"{_snames[si]}可上此班的 {_s2_label} 不足 2 位(目前 {n_second} 位),無法滿足『{_s2_rule}』硬規則")
 
         # 優先顯示預先偵測到的具體衝突
         if pre_conflicts:
@@ -1960,8 +1969,9 @@ def generate_schedule(
                     _mark = ""
                     if _nl < 1: _mark = " ← H7 缺 leader!"
                     elif _nl == 1: _mark = " ← 只 1 leader,幾乎不可能每天在班"
-                    elif _ns < 2: _mark = " ← H8 缺 leader+second!"
-                    _ldr_lines.append(f"    {_sn[si]}: leader {_nl} 人 · leader+second {_ns} 人{_mark}")
+                    elif _ns < 2: _mark = (" ← H8 缺 leader+second!" if si == 0 else " ← H8 缺 leader+second+third!")
+                    _senior_lbl = "leader+second" if si == 0 else "leader+second+third"
+                    _ldr_lines.append(f"    {_sn[si]}: leader {_nl} 人 · {_senior_lbl} {_ns} 人{_mark}")
             _ldr_block = "\n".join(_ldr_lines) if _ldr_lines else "    (無需求)"
 
             # 離職者資訊附加到失敗訊息(幫助用戶確認 solver 是否感知到)
@@ -1984,7 +1994,7 @@ def generate_schedule(
                 + _term_block +
                 "🔴 A. 人力不足(較常見)\n"
                 f"  · 每班每日人數(S1):臨床 {M - len(trainee_set)} 人(不含新人),每日總需求 D+E+N = {sum([daily_d, daily_e, daily_n])} 人\n"
-                f"  · Leader/資深供給量(H7/H8):以下數字為「屬性允許上此班」的人數上限(供給),不是每日需求。硬規則是「每日至少 1 leader、每日至少 2 leader+second」:\n"
+                f"  · Leader/資深供給量(H7/H8):以下數字為「屬性允許上此班」的人數上限(供給),不是每日需求。硬規則是「每日至少 1 leader;白班每日至少 2 leader+second,夜班每日至少 2 leader+second+third」:\n"
                 f"{_ldr_block}\n"
                 "    (例:D班 leader 12 人 = 共 12 位 leader 的屬性允許上 D 班,每日需求只要排到其中 1 位即可)\n"
                 "  · 檢查排班規則 tab:各班每日人數是否設太高?一例一休是否勾選(勾選會降低可排天數)?\n"
@@ -2049,7 +2059,9 @@ def generate_schedule(
             _sa_halftime = {_m: bool(nurses[_m].get("halftime")) for _m in range(M)}
             _sa_trainee = set(trainee_set)
             _sa_is_leader = {_m: (nurses[_m].get("level") == "leader") for _m in range(M)}
-            _sa_is_ls = {_m: (nurses[_m].get("level") in ("leader", "second")) for _m in range(M)}
+            # D 班資深(leader+second);E/N 班資深(leader+second+third)
+            _sa_is_ls_d  = {_m: (nurses[_m].get("level") in ("leader", "second")) for _m in range(M)}
+            _sa_is_ls_en = {_m: (nurses[_m].get("level") in ("leader", "second", "third")) for _m in range(M)}
 
             # allowed_si per nurse(含 3=OFF)
             _sa_allowed_si: dict = {}
@@ -2091,7 +2103,8 @@ def generate_schedule(
                 halftime=_sa_halftime,
                 trainee=_sa_trainee,
                 is_leader=_sa_is_leader,
-                is_leader_or_second=_sa_is_ls,
+                is_leader_or_second_d=_sa_is_ls_d,
+                is_leader_or_second_en=_sa_is_ls_en,
                 allowed_si=_sa_allowed_si,
                 dev_cap_rot=_sa_dev_cap,
                 fixed_si=_sa_fixed_si,

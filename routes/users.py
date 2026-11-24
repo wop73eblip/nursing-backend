@@ -19,7 +19,7 @@ class UserCreate(BaseModel):
     password: str
     name: str
     role: str        # nurse, dual, admin, superadmin
-    level: str       # leader, second, member
+    level: str       # leader, second, third, member
     attr: str        # 輪班屬性
     halftime: bool = False
     admin_staff: bool = False   # 行政人員:可預班但不參與一鍵生成

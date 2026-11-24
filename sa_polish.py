@@ -10,7 +10,7 @@ SA post-processing (Phase 1)
   - no reverse shift (E→D, N→E, N→D)
   - max_consec 連上限 (視窗)
   - 每週 shift types ≤ 2
-  - leader >= 1, leader+second >= min(2, req)
+  - leader >= 1, 資深 >= min(2, req)(D 用 leader+second、E/N 用 leader+second+third)
 
 軟分只算 3 項(Phase 1 最痛的):
   - SEGMENT_PENALTY (段數集中)
@@ -39,7 +39,9 @@ class SAContext:
     halftime: dict[int, bool]           # m -> True/False
     trainee: set[int]                   # 新人 index
     is_leader: dict[int, bool]          # m -> is leader
-    is_leader_or_second: dict[int, bool]
+    # 資深「依班別」分兩個欄位:D 班 = leader+second;E/N 班 = leader+second+third
+    is_leader_or_second_d: dict[int, bool]
+    is_leader_or_second_en: dict[int, bool]
     allowed_si: dict[int, set[int]]     # m -> set of allowed shift si (含 3)
     dev_cap_rot: dict[int, int]         # m -> attr 偏離配額(輪班),default 0
     fixed_si: dict[int, int | None]     # m -> 固定 si (0/1/2) 或 None
@@ -281,15 +283,20 @@ def _swap_is_valid(
     # → 淨變化為 0!人數守恆
     # 但 leader/second 屬性可能不同:
     #   若 is_leader(a) True 且 is_leader(b) False → sa 少 1 leader、sb 多 1 leader
+    def _is_senior_for_si(m: int, si_q: int) -> bool:
+        # D(si=0) 用 leader+second;E/N(si=1,2) 用 leader+second+third
+        if si_q == 0:
+            return ctx.is_leader_or_second_d.get(m, False)
+        return ctx.is_leader_or_second_en.get(m, False)
+
     a_is_ldr = ctx.is_leader.get(a, False)
     b_is_ldr = ctx.is_leader.get(b, False)
-    a_is_ls = ctx.is_leader_or_second.get(a, False)
-    b_is_ls = ctx.is_leader_or_second.get(b, False)
 
     delta_ldr_sa = (-1 if a_is_ldr else 0) + (1 if b_is_ldr else 0)
     delta_ldr_sb = (1 if a_is_ldr else 0) + (-1 if b_is_ldr else 0)
-    delta_ls_sa  = (-1 if a_is_ls else 0) + (1 if b_is_ls else 0)
-    delta_ls_sb  = (1 if a_is_ls else 0) + (-1 if b_is_ls else 0)
+    # sa / sb 班的「資深」定義可能不同(白班 vs 夜班)
+    delta_ls_sa = (-1 if _is_senior_for_si(a, sa) else 0) + (1 if _is_senior_for_si(b, sa) else 0)
+    delta_ls_sb = (1 if _is_senior_for_si(a, sb) else 0) + (-1 if _is_senior_for_si(b, sb) else 0)
 
     req_map = {0: ctx.day_d[t], 1: ctx.day_e[t], 2: ctx.day_n[t]}
 
@@ -364,7 +371,9 @@ def sa_polish(assign: dict[tuple[int, int], int], ctx: SAContext,
                     continue
                 if ctx.is_leader.get(m, False):
                     l_c += 1
-                if ctx.is_leader_or_second.get(m, False):
+                # second_cnt 依班別算:si=0 用 _d,si=1/2 用 _en
+                _senior_map = ctx.is_leader_or_second_d if si == 0 else ctx.is_leader_or_second_en
+                if _senior_map.get(m, False):
                     s_c += 1
             leader_cnt[(t, si)] = l_c
             second_cnt[(t, si)] = s_c
@@ -445,12 +454,15 @@ def sa_polish(assign: dict[tuple[int, int], int], ctx: SAContext,
             # 更新 leader/second cache
             a_is_ldr = ctx.is_leader.get(a, False)
             b_is_ldr = ctx.is_leader.get(b, False)
-            a_is_ls = ctx.is_leader_or_second.get(a, False)
-            b_is_ls = ctx.is_leader_or_second.get(b, False)
+            # sa / sb 班的「資深」定義可能不同
+            _sa_sm = ctx.is_leader_or_second_d if sa == 0 else ctx.is_leader_or_second_en
+            _sb_sm = ctx.is_leader_or_second_d if sb == 0 else ctx.is_leader_or_second_en
+            a_is_ls_sa = _sa_sm.get(a, False); b_is_ls_sa = _sa_sm.get(b, False)
+            a_is_ls_sb = _sb_sm.get(a, False); b_is_ls_sb = _sb_sm.get(b, False)
             leader_cnt[(t, sa)] += (-1 if a_is_ldr else 0) + (1 if b_is_ldr else 0)
             leader_cnt[(t, sb)] += (1 if a_is_ldr else 0) + (-1 if b_is_ldr else 0)
-            second_cnt[(t, sa)] += (-1 if a_is_ls else 0) + (1 if b_is_ls else 0)
-            second_cnt[(t, sb)] += (1 if a_is_ls else 0) + (-1 if b_is_ls else 0)
+            second_cnt[(t, sa)] += (-1 if a_is_ls_sa else 0) + (1 if b_is_ls_sa else 0)
+            second_cnt[(t, sb)] += (1 if a_is_ls_sb else 0) + (-1 if b_is_ls_sb else 0)
             curr_cost += delta
             accepted += 1
             if curr_cost < best_cost:
