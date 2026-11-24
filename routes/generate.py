@@ -135,7 +135,7 @@ def generate_schedule(
     restrict_first_weekend = bool(scheduling.get("restrict_first_weekend", True))
     one_in_seven = bool(scheduling.get("one_in_seven", True))   # 一例一休
     lock_first_day       = bool(scheduling.get("lock_first_day", True))
-    weekly_max_off_auto  = int(scheduling.get("weekly_max_off_auto", 2))   # 自動休連續天數上限
+    weekly_max_off_auto  = int(scheduling.get("weekly_max_off_auto", 3))   # 自動休連續天數上限
     weekly_max_off_total = int(scheduling.get("weekly_max_off_total", 3))  # 每週應休總上限
     holiday_days = int(cycle.get("holiday_days", 0))
     full_off  = min(8 + holiday_days, 13)
