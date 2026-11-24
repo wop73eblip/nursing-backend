@@ -83,9 +83,6 @@ def generate_schedule(
     ratio      = rules.get("ratio", {})
     ratio_overrides_list = rules.get("ratio_overrides", [])
     ratio_overrides = {o["nurse_uid"]: o["ratio"] for o in ratio_overrides_list}
-    # 個別護理師 attr 偏離配額(允許排非 attr 班別幾天):[{nurse_uid, days}]
-    _nurse_dev_list = rules.get("nurse_deviation_overrides", []) or []
-    _nurse_dev_overrides = {o["nurse_uid"]: int(o.get("days") or 0) for o in _nurse_dev_list if o.get("nurse_uid")}
     # 班別限制(特殊情況):某護理師在某段日期若排上班只能是指定班別(例:莉莉 12/14-1/3 只能 D,帶新人)
     # 格式:[{nurse_uid, start_date, end_date, allowed_shifts:["D"]}]
     # 作用:對 (m, t) 的 WORK si 加硬約束,OFF 不受限
@@ -457,31 +454,17 @@ def generate_schedule(
         # 疊加「硬規則4：每週至多兩種班別」（絕對值，見下方）後，會自然逼迫求解器
         # 讓該週自由格只保留原兩種班別中的其中一種（例如輪班DE遇例外N → 自由格收斂為全D或全E）
         fixed_si = FIXED_SHIFT_MAP.get(attr)
-        # 個別護理師偏離配額(來自 rules.data.nurse_deviation_overrides,per-nurse 允許偏 attr 幾天)
-        _rot_dev_cap = _nurse_dev_overrides.get(uid, 0)   # 輪班 attr default 0(嚴格)
         if fixed_si is None:
             allowed = SHIFT_ALLOWED.get(attr, WORK_SHIFTS)
             allowed_si = set(SI[s] for s in allowed) | {3}
             if "allowed" not in DEBUG_SKIP:
-                if _rot_dev_cap > 0:
-                    # 允許偏 attr 次數:非 attr 的班別總和 ≤ cap
-                    _dev_terms = []
-                    for t in range(n):
-                        if t in exception_days_m:
-                            continue
-                        for s in range(4):
-                            if s not in allowed_si:
-                                _dev_terms.append(b[m][t][s])
-                    if _dev_terms:
-                        model.add(sum(_dev_terms) <= _rot_dev_cap)
-                else:
-                    # 嚴格禁止非 attr 班別
-                    for t in range(n):
-                        if t in exception_days_m:
-                            continue  # 屬性衝突的預填日:保留預填值,跳過班種限制
-                        for s in range(4):
-                            if s not in allowed_si:
-                                model.add(b[m][t][s] == 0)
+                # 嚴格禁止非 attr 班別
+                for t in range(n):
+                    if t in exception_days_m:
+                        continue  # 屬性衝突的預填日:保留預填值,跳過班種限制
+                    for s in range(4):
+                        if s not in allowed_si:
+                            model.add(b[m][t][s] == 0)
 
         # ── 休假天數（LEAVE_ADJUST 不計入應休名額）
         la_count = len(leave_adjust_days_m)
@@ -628,10 +611,10 @@ def generate_schedule(
                 model.add(has_D + has_E + has_N <= 2)
 
         # ── 連續上班上限(H9):視窗 max_consec+1 天內,工作 (D/E/N) ≤ max_consec
-        # 可選擴充(scheduling.include_la_in_consec 預設 False):LA 也算連續
+        # 可選擴充(scheduling.include_la_in_consec 預設 True):LA 也算連續
         # 啟用時:連續「上班類+LA」≤ max_consec,一旦達到必須有真 OFF 斷開
         # 注意:啟用會讓 solver 變慢明顯。
-        _include_la_consec = bool(scheduling.get("include_la_in_consec", False))
+        _include_la_consec = bool(scheduling.get("include_la_in_consec", True))
         _hist_raw = hist_raw_by_nurse.get(uid, ["OFF"] * HISTORY_DAYS)
         def _is_hist_la(hist_idx: int) -> int:
             if 0 <= hist_idx < HISTORY_DAYS:
@@ -1313,11 +1296,9 @@ def generate_schedule(
                             penalties.append(b[m][t][s] * FIX_PENALTY)
                             deviation_terms.append(b[m][t][s])
             if deviation_terms:
-                # 硬上限：偏離格數 ≤ FIX_MAX_DEVIATION;預填鎖定已超過時放寬,個別護理師覆蓋優先
+                # 硬上限：偏離格數 ≤ FIX_MAX_DEVIATION;預填鎖定已超過時放寬
                 locked_dev = sum(_locked_cnt[s] for s in range(3) if s != fixed_si)
-                # 讀取 per-nurse override(rules.data.nurse_deviation_overrides)
-                _nurse_dev_here = _nurse_dev_overrides.get(uid, FIX_MAX_DEVIATION)
-                _fix_cap = max(_nurse_dev_here, locked_dev)
+                _fix_cap = max(FIX_MAX_DEVIATION, locked_dev)
                 _a_fix = model.new_bool_var(f"a_fix_{m}")
                 model.add(sum(deviation_terms) <= _fix_cap).only_enforce_if(_a_fix)
                 assume_reg.append((_a_fix, f"{attr}固定班別(偏離≤{_fix_cap}格) — {nurse_name}"))
@@ -1504,7 +1485,7 @@ def generate_schedule(
 
     # 診斷 5:連續上班預填超標(只掃本次週期內,不含歷史)
     # 當 scheduling.include_la_in_consec = True 時,LA 也算入連續
-    _include_la_diag = bool(scheduling.get("include_la_in_consec", False))
+    _include_la_diag = bool(scheduling.get("include_la_in_consec", True))
     if max_consec > 0 and "consec_diag" not in DEBUG_SKIP:
         if _include_la_diag:
             REST_SET = REST_CODES | {"OFF"}
@@ -2070,7 +2051,7 @@ def generate_schedule(
                 _allowed = SHIFT_ALLOWED.get(_attr, WORK_SHIFTS)
                 _sa_allowed_si[_m] = {SI[_s] for _s in _allowed} | {3}
             _sa_fixed_si = {_m: FIXED_SHIFT_MAP.get(_sa_attr_map[_m]) for _m in range(M)}
-            _sa_dev_cap = {_m: _nurse_dev_overrides.get(nurses[_m]["uid"], 0) for _m in range(M)}
+            _sa_dev_cap = {_m: 0 for _m in range(M)}
 
             # 建 ratio pairs per nurse(依 attr 建 2/3 pairs)
             def _sa_r(attr_key: str, generic_key: str, uid: str) -> int:
