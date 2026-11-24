@@ -694,6 +694,9 @@ def generate_schedule(
         # ── 規則 6：自動休連續天數上限（半職護理師跳過）
         if not is_ht and "rule6" not in DEBUG_SKIP:
             for t in range(n - weekly_max_off_auto):
+                # 離職者:視窗跨 terminated_days → 跳過(視同連休既成事實,跟 rule7 一致)
+                if any((t + k) in terminated_days_m for k in range(weekly_max_off_auto + 1)):
+                    continue
                 auto_off_win = [
                     b[m][t+k][3]
                     for k in range(weekly_max_off_auto + 1)
