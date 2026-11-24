@@ -478,7 +478,7 @@ def generate_schedule(
             off_days = guaranteed_off  # 全職用 full_off，半職用 part_off
             off_days = max(0, min(off_days, n - la_count - 1))
             off_upper = off_days
-            _slack_max = max(0, pen("SLACK_MAX_PER_NURSE", 2))   # 每人少休上限(人力吃緊時可拉高至 5-7)
+            _slack_max = max(0, pen("SLACK_MAX_PER_NURSE", 0))   # 每人少休上限(人力吃緊時可拉高至 5-7)
 
         # 應休 OFF（排除 LEAVE_ADJUST + 離職者的鎖定 OFF）
         free_off = [b[m][t][3] for t in range(n) if t not in leave_adjust_days_m and t not in terminated_days_m]
@@ -921,7 +921,7 @@ def generate_schedule(
     _non_term_slack_vars = [(m_i, sv, p) for (m_i, sv, p) in off_slack_vars
                             if nurses[m_i].get("uid") not in dep_info]
     if _non_term_slack_vars:
-        _sk_ub = max(0, pen("SLACK_MAX_PER_NURSE", 2))
+        _sk_ub = max(0, pen("SLACK_MAX_PER_NURSE", 0))
         _max_sk = model.new_int_var(0, _sk_ub, "max_off_slack")
         _min_sk = model.new_int_var(0, _sk_ub, "min_off_slack")
         for _, sv, _ in _non_term_slack_vars:
@@ -995,7 +995,7 @@ def generate_schedule(
     # ── H7 雙週期比例硬上限:讀「管理員手動輸入」的上週期各護理師 D/E/N 計數
     # 儲存位置:rules.data.prev_cycle_counts = { uid: {D, E, N} }
     # 管理員在「手動填寫」tab 的「上週期」按鈕下輸入,不自動 sync DB shifts
-    _dual_cap = pen("RATIO_CAP_DAYS_DUAL", 0)
+    _dual_cap = pen("RATIO_CAP_DAYS_DUAL", 3)
     _prev_cycle_counts: dict[str, list[int]] = {}   # {uid: [d, e, n]}
     if _dual_cap > 0:
         _raw_pc = rules.get("prev_cycle_counts") or {}
@@ -1022,7 +1022,7 @@ def generate_schedule(
         # 另設硬上限：全職、半職每班種偏差皆 ≤ ±2 天（預填鎖定已超過時自動讓路）
         DIST_PENALTY = int(pen("DIST_PENALTY", 900) * FAIR_MULT)
         _is_ht_m = bool(nurses[m].get("halftime"))
-        _cap_days = pen("RATIO_CAP_DAYS", 2)   # H13 比例硬上限;env 可覆蓋(2 較嚴、4-5 較鬆)
+        _cap_days = pen("RATIO_CAP_DAYS", 5)   # H13 比例硬上限;env 可覆蓋(2 較嚴、4-5 較鬆)
         _locked_cnt = locked_si_counts_per_m.get(m, [0, 0, 0])
         _total_d  = sum(b[m][t][0] for t in range(n))
         _total_e  = sum(b[m][t][1] for t in range(n))
@@ -1177,7 +1177,7 @@ def generate_schedule(
             _iso_vars_m.append(iso)
         # 每人孤立日硬上限(H17):全職 default 1,半職 default 2(密度稀,給多 1 個 buffer)
         # -1 = 不限制;0 = 完全禁止(≤0);N>0 = 上限 N
-        _iso_per_cap = pen("ISO_MAX_PER_NURSE_HT", 2) if is_ht else pen("ISO_MAX_PER_NURSE", 1)
+        _iso_per_cap = pen("ISO_MAX_PER_NURSE_HT", 1) if is_ht else pen("ISO_MAX_PER_NURSE", 2)
         if _iso_per_cap >= 0 and _iso_vars_m:
             _a_iso_m = model.new_bool_var(f"a_iso_per_{m}")
             model.add(sum(_iso_vars_m) <= _iso_per_cap).only_enforce_if(_a_iso_m)
@@ -1193,10 +1193,10 @@ def generate_schedule(
         # - ULTRA_SHORT_BLOCK_PENALTY 預設 3000(比 2 天更痛)
         # - SHORT_BLOCK_PENALTY 預設 500
         # 舊 SHORT_BLOCK_PENALTY 保留兼容:若有 ULTRA 就用 ULTRA,否則 fallback SHORT×2
-        _short2_pen = int(pen("SHORT_BLOCK_PENALTY", 500) * SWITCH_MULT)   # 2 天塊
+        _short2_pen = int(pen("SHORT_BLOCK_PENALTY", 800) * SWITCH_MULT)   # 2 天塊
         _ultra_pen  = int(pen("ULTRA_SHORT_BLOCK_PENALTY", 3000) * SWITCH_MULT)  # 1 天塊
         _long_pen = int(pen("LONG_BLOCK_PENALTY", 800) * SWITCH_MULT)
-        _mid_reward = int(pen("MID_BLOCK_REWARD", 500) * SWITCH_MULT)  # 3-4 天塊獎勵(建模時取負)
+        _mid_reward = int(pen("MID_BLOCK_REWARD", 1500) * SWITCH_MULT)  # 3-4 天塊獎勵(建模時取負)
         if (_short2_pen > 0 or _ultra_pen > 0 or _long_pen > 0 or _mid_reward > 0) and not is_ht:
             for _s in (0, 1, 2):  # 對 D/E/N 各自算塊
                 for t in range(n):
@@ -1394,7 +1394,7 @@ def generate_schedule(
                     assume_reg.append((_a_sw_m, f"每人換班次數 ≤ {_sw_cap} — {nurse_name}"))
 
     # ── 孤立日總數硬上限: -1 = 不限制;0 = 完全禁止(≤0);N>0 = 上限 N
-    _ISO_TOTAL_MAX = pen("ISOLATED_MAX_TOTAL", -1)
+    _ISO_TOTAL_MAX = pen("ISOLATED_MAX_TOTAL", 0)
     if _ISO_TOTAL_MAX >= 0 and _all_iso_vars:
         model.add(sum(_all_iso_vars) <= _ISO_TOTAL_MAX)
         _lbl = "禁止任何孤立日" if _ISO_TOTAL_MAX == 0 else f"全體孤立日總數 ≤ {_ISO_TOTAL_MAX}"
@@ -2125,7 +2125,7 @@ def generate_schedule(
                 ratio_pairs=_sa_pairs,
                 seg_pen=int(pen("SEGMENT_PENALTY", 5000) * SWITCH_MULT),
                 ultra_pen=int(pen("ULTRA_SHORT_BLOCK_PENALTY", 3000) * SWITCH_MULT),
-                short_pen=int(pen("SHORT_BLOCK_PENALTY", 500) * SWITCH_MULT),
+                short_pen=int(pen("SHORT_BLOCK_PENALTY", 800) * SWITCH_MULT),
                 dist_pen=int(pen("DIST_PENALTY", 900) * FAIR_MULT),
                 max_seconds=pen_float("SA_SECONDS", 30.0),
                 max_iter=pen("SA_MAX_ITER", 100000),
@@ -2404,8 +2404,8 @@ def generate_schedule(
     _pq_pens = {
         "SEG": int(pen("SEGMENT_PENALTY", 5000) * SWITCH_MULT),
         "ULTRA": int(pen("ULTRA_SHORT_BLOCK_PENALTY", 3000) * SWITCH_MULT),
-        "SHORT": int(pen("SHORT_BLOCK_PENALTY", 500) * SWITCH_MULT),
-        "MID": int(pen("MID_BLOCK_REWARD", 500) * SWITCH_MULT),
+        "SHORT": int(pen("SHORT_BLOCK_PENALTY", 800) * SWITCH_MULT),
+        "MID": int(pen("MID_BLOCK_REWARD", 1500) * SWITCH_MULT),
         "LONG": int(pen("LONG_BLOCK_PENALTY", 800) * SWITCH_MULT),
         "ISO": pen("ISOLATED_WORK_PENALTY", 750),   # solver 沒乘 SWITCH_MULT
         "EXCESS": int(pen("EXCESS_SWITCH_PENALTY", 1500) * SWITCH_MULT),

@@ -103,9 +103,9 @@ class TestH12_HalftimeQuota:
             off_count = sum(1 for d in cycle_dates if _s(sched, d) in REST_LIKE)
             la_count = sum(1 for d in cycle_dates if _s(sched, d) in LEAVE_ADJUST_LIKE)
             quota = max(0, min(part_off, n - la_count - 1))
-            # 半職少休上限 = SLACK_MAX_PER_NURSE (default 2);允許 max 2 天差
+            # 半職少休上限 = SLACK_MAX_PER_NURSE (default 0);允許 max slack_max 天差
             _sm = rules.get("penalties", {}).get("SLACK_MAX_PER_NURSE")
-            slack_max = int(_sm) if _sm is not None else 2
+            slack_max = int(_sm) if _sm is not None else 0
             assert off_count >= quota - slack_max, \
                 f"半職 {u['name']} 實休 {off_count} < quota {quota} - slack_max {slack_max}"
 
@@ -118,7 +118,7 @@ class TestH13_SingleCycleRatioCap:
         penalties = rules.get("penalties", {}) or {}
         ratio = rules.get("ratio", {}) or {}
         _cap_raw = penalties.get("RATIO_CAP_DAYS")
-        cap = int(_cap_raw) if _cap_raw is not None else 2
+        cap = int(_cap_raw) if _cap_raw is not None else 5
         # 對每個輪班 attr 護理師檢查其 pair
         pair_defs = {
             "輪班DE": [("D", "de_d", "E", "de_e")],
@@ -177,8 +177,8 @@ class TestH18_IsolatedWorkCap:
         penalties = rules.get("penalties", {}) or {}
         _cf = penalties.get("ISO_MAX_PER_NURSE")
         _ch = penalties.get("ISO_MAX_PER_NURSE_HT")
-        cap_full = int(_cf) if _cf is not None else 1
-        cap_half = int(_ch) if _ch is not None else 2
+        cap_full = int(_cf) if _cf is not None else 2
+        cap_half = int(_ch) if _ch is not None else 1
         for u in users:
             if u.get("admin_staff"):
                 continue
