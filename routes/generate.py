@@ -672,8 +672,9 @@ def generate_schedule(
         # target = weekly_max_off_auto(自動休連續上限),中間含 LA 不算、離職者/半職跳過
         # target <= 2 時已被上面「連 2 OFF」硬規則涵蓋,跳過(避免重複)
         _long_off_target = weekly_max_off_auto
-        if (not is_ht and not _dep and off_days > 8 and _long_off_target >= 3
-                and "long_off" not in DEBUG_SKIP):
+        _no_long_off_pen = pen("NO_LONG_OFF_PENALTY", 1000)
+        if (_no_long_off_pen > 0 and not is_ht and not _dep and off_days > 8
+                and _long_off_target >= 3 and "long_off" not in DEBUG_SKIP):
             _long_off_vars = []
             for t in range(n - _long_off_target + 1):
                 if any((t + k) in leave_adjust_days_m for k in range(_long_off_target)):
@@ -687,10 +688,8 @@ def generate_schedule(
                 _has_long_off = model.new_bool_var(f"has_long_off_{m}")
                 model.add(sum(_long_off_vars) >= 1).only_enforce_if(_has_long_off)
                 model.add(sum(_long_off_vars) == 0).only_enforce_if(_has_long_off.negated())
-                _no_long_off_pen = pen("NO_LONG_OFF_PENALTY", 1000)
-                if _no_long_off_pen > 0:
-                    # 沒排出任何連續 target 天 OFF → 扣 _no_long_off_pen
-                    penalties.append((1 - _has_long_off) * _no_long_off_pen)
+                # 沒排出任何連續 target 天 OFF → 扣 _no_long_off_pen
+                penalties.append((1 - _has_long_off) * _no_long_off_pen)
 
         # ── 首個週末不同時休：此規則已改為「護理師預班階段硬擋」（前端 NursePage 處理），
         #    自動排班不再受此約束（自動排班若給首週末雙休沒有問題）。
