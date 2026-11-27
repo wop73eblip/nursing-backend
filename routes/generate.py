@@ -184,6 +184,14 @@ def generate_schedule(
 
     # ── 計算每位離職者在本週期的 eff_days + min_OFF/max_OFF
     # dep_info[uid] = {eff_days, full_weeks, partial_days, min_off, max_off, term_date_idx}
+    # 離職者的 OFF 配額 = 一例一休基本 + 在職期間遇到的國定假日天數
+    # 國定假日日期清單 cycle.holiday_dates(YYYY-MM-DD 陣列),僅對離職者生效
+    _holiday_date_set: set[date_type] = set()
+    for _hd in (cycle.get("holiday_dates") or []):
+        try:
+            _holiday_date_set.add(date_type.fromisoformat(str(_hd)))
+        except (ValueError, TypeError):
+            pass
     dep_info: dict[str, dict] = {}
     for _nu in nurses:
         _t_str = _nu.get("terminated_at")
@@ -200,12 +208,19 @@ def generate_schedule(
             continue
         _full = _eff // 7
         _partial = _eff % 7
+        # 在職期間的國定假日天數(start_d <= h <= _t_date)
+        _holiday_in_service = sum(1 for h in _holiday_date_set if start_d <= h <= _t_date)
+        # 基本配額 = 一例一休 2 倍 + partial 6 時強制 +1(短週 OFF 下限)
+        _base_off = _full * 2 + (1 if _partial == 6 else 0)
+        # 加上在職期間國定假日 → 下限 = 上限 = 固定值,避免 solver 把額度挪到其他週
+        _total_off = _base_off + _holiday_in_service
         dep_info[_nu["uid"]] = {
             "eff_days": _eff,
             "full_weeks": _full,
             "partial_days": _partial,
-            "min_off": _full * 2 + (1 if _partial == 6 else 0),
-            "max_off": _full * 2 + min(_partial, 2),
+            "min_off": _total_off,
+            "max_off": _total_off,   # 鎖死,離職者不允許超休
+            "holiday_in_service": _holiday_in_service,
             "term_date_idx": _eff - 1,   # 最後上班日的 t index
         }
     M = len(nurses)
