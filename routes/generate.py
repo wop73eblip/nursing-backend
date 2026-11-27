@@ -612,22 +612,25 @@ def generate_schedule(
                         penalties.append(_ov * _wk_pen)
             # 否則整週鎖滿上班 → 跳過約束（異常偵測會在生成後標示警告）
 
-        # ── 離職者 OFF 分布軟規則:每週 OFF 超過 2 天每天罰 DEP_WEEKLY_OFF_OVER_PENALTY
+        # ── 離職者 OFF 分布硬上限:每週 OFF <= 2 + bonus_wi,sum(bonus_wi) == holidays_in_service
         # 目的:避免 solver 把 holiday 的 +1 彈性全擠到一週(例如 W2 塞 4 OFF)
-        # 軟規則 → 不會造成 INFEASIBLE,解空間仍可行;強懲罰值逼 solver 平均分佈
-        # 允許單週 3 OFF(容納 holiday bonus),4+ OFF 會被極重懲罰
-        if _dep and "dep_week_cap" not in DEBUG_SKIP:
-            _dep_wk_pen = pen("DEP_WEEKLY_OFF_OVER_PENALTY", 3000)
+        # 純硬約束(不用 only_enforce_if + assume_reg):若 INFEASIBLE 不會爆 unsat core 搜尋
+        # bonus 是 model int var,solver 自行決定 holiday 要放哪一週(含 partial)
+        if _dep and "dep_bonus" not in DEBUG_SKIP:
+            _hol = _dep.get("holiday_in_service", 0)
+            _bonus_vars_m: list = []
             for wi, (ws, we) in enumerate(weeks):
                 _week_t = [t for t in range(ws, we + 1) if t not in terminated_days_m]
                 if not _week_t:
-                    continue
+                    continue  # 整週都在離職後,跳過
                 _week_rest = sum(
                     b[m][t][3] for t in _week_t if t not in leave_adjust_days_m
                 )
-                _dw_ov = model.new_int_var(0, len(_week_t), f"dep_wkov_{m}_{wi}")
-                model.add(_dw_ov >= _week_rest - 2)
-                penalties.append(_dw_ov * _dep_wk_pen)
+                _bv = model.new_int_var(0, max(1, _hol), f"off_bonus_{m}_{wi}")
+                model.add(_week_rest <= 2 + _bv)   # 純硬約束,不走 assume_reg
+                _bonus_vars_m.append(_bv)
+            if _bonus_vars_m:
+                model.add(sum(_bonus_vars_m) == _hol)  # holiday 必須全消耗
 
         # ── 硬規則 4：每週 D/E/N 至多兩種班別（絕對硬性，不放寬）
         # 例外日造成的第三種班種，由上方「允許班種限制」放寬自由格來讓路，
