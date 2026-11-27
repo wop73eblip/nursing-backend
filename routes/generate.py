@@ -212,14 +212,17 @@ def generate_schedule(
         _holiday_in_service = sum(1 for h in _holiday_date_set if start_d <= h <= _t_date)
         # 基本配額 = 一例一休 2 倍 + partial 6 時強制 +1(短週 OFF 下限)
         _base_off = _full * 2 + (1 if _partial == 6 else 0)
-        # 加上在職期間國定假日 → 下限 = 上限 = 固定值,避免 solver 把額度挪到其他週
-        _total_off = _base_off + _holiday_in_service
+        # 總配額區間:
+        #   下限 = base(一例一休) + holidays (holiday 是 entitlement,必拿)
+        #   上限 = base + partial 彈性 + holidays (容納 partial 填滿 + 全數假日)
+        # 分佈控制由「每週硬上限 2+bonus_wi, sum(bonus)=holidays」另外加約束
+        _partial_slack = 2 if (_partial > 0 and _partial != 6) else (1 if _partial == 6 else 0)
         dep_info[_nu["uid"]] = {
             "eff_days": _eff,
             "full_weeks": _full,
             "partial_days": _partial,
-            "min_off": _total_off,
-            "max_off": _total_off,   # 鎖死,離職者不允許超休
+            "min_off": _base_off + _holiday_in_service,
+            "max_off": _base_off + _partial_slack + _holiday_in_service,
             "holiday_in_service": _holiday_in_service,
             "term_date_idx": _eff - 1,   # 最後上班日的 t index
         }
@@ -608,6 +611,29 @@ def generate_schedule(
                         model.add(_ov >= week_rest_sum - _th)
                         penalties.append(_ov * _wk_pen)
             # 否則整週鎖滿上班 → 跳過約束（異常偵測會在生成後標示警告）
+
+        # ── 離職者 OFF 分布硬上限:每週 OFF <= 2 + bonus_wi,sum(bonus_wi) == holidays_in_service
+        # 目的:避免 solver 把 holiday 的 +1 彈性全擠到一週(例如 W2 塞 4 OFF)
+        # bonus 是 model int var,solver 自行決定 holiday 要放哪一週(含 partial)
+        if _dep and _dep.get("holiday_in_service", 0) > 0 and "dep_bonus" not in DEBUG_SKIP:
+            _hol = _dep["holiday_in_service"]
+            _bonus_vars_m: list = []
+            for wi, (ws, we) in enumerate(weeks):
+                _week_t = [t for t in range(ws, we + 1) if t not in terminated_days_m]
+                if not _week_t:
+                    continue  # 整週都在離職後,跳過
+                _week_rest = sum(
+                    b[m][t][3] for t in _week_t if t not in leave_adjust_days_m
+                )
+                _bv = model.new_int_var(0, _hol, f"off_bonus_{m}_{wi}")
+                _a_bonus = model.new_bool_var(f"a_dep_bonus_{m}_{wi}")
+                model.add(_week_rest <= 2 + _bv).only_enforce_if(_a_bonus)
+                assume_reg.append((_a_bonus, f"{nurse_name} 第{wi+1}週 OFF ≤ 2 + holiday bonus"))
+                _bonus_vars_m.append(_bv)
+            if _bonus_vars_m:
+                _a_bonus_sum = model.new_bool_var(f"a_dep_bonus_sum_{m}")
+                model.add(sum(_bonus_vars_m) == _hol).only_enforce_if(_a_bonus_sum)
+                assume_reg.append((_a_bonus_sum, f"{nurse_name} holiday bonus 總和 = {_hol}"))
 
         # ── 硬規則 4：每週 D/E/N 至多兩種班別（絕對硬性，不放寬）
         # 例外日造成的第三種班種，由上方「允許班種限制」放寬自由格來讓路，
@@ -2197,7 +2223,7 @@ def generate_schedule(
         for _uid, _info in dep_info.items():
             _nm = next((x.get("name") for x in nurses if x["uid"] == _uid), _uid)
             _dep_lines.append(
-                f"{_nm}:eff_days={_info['eff_days']}, min_off={_info['min_off']}, max_off={_info['max_off']}"
+                f"{_nm}:eff_days={_info['eff_days']}, min_off={_info['min_off']}, max_off={_info['max_off']}, holiday={_info.get('holiday_in_service', 0)}"
             )
         warnings.append(f"ℹ 離職者處理:{len(dep_info)} 人(" + "; ".join(_dep_lines) + ")")
     if _extra_rules_diag:
