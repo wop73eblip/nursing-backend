@@ -10,7 +10,7 @@ SA post-processing (Phase 1)
   - no reverse shift (E→D, N→E, N→D)
   - max_consec 連上限 (視窗)
   - 每週 shift types ≤ 2
-  - leader >= 1, 資深 >= min(2, req)(D 用 leader+second、E/N 用 leader+second+third)
+  - leader >= 1, 資深 >= min(2, req)(D/E/N 統一 = leader+second)
 
 軟分只算 3 項(Phase 1 最痛的):
   - SEGMENT_PENALTY (段數集中)
@@ -39,7 +39,7 @@ class SAContext:
     halftime: dict[int, bool]           # m -> True/False
     trainee: set[int]                   # 新人 index
     is_leader: dict[int, bool]          # m -> is leader
-    # 資深「依班別」分兩個欄位:D 班 = leader+second;E/N 班 = leader+second+third
+    # 資深 D/E/N 統一 = leader+second(third 層級已移除;兩欄位內容相同,保留欄位名以兼容舊 call site)
     is_leader_or_second_d: dict[int, bool]
     is_leader_or_second_en: dict[int, bool]
     allowed_si: dict[int, set[int]]     # m -> set of allowed shift si (含 3)
@@ -284,10 +284,8 @@ def _swap_is_valid(
     # 但 leader/second 屬性可能不同:
     #   若 is_leader(a) True 且 is_leader(b) False → sa 少 1 leader、sb 多 1 leader
     def _is_senior_for_si(m: int, si_q: int) -> bool:
-        # D(si=0) 用 leader+second;E/N(si=1,2) 用 leader+second+third
-        if si_q == 0:
-            return ctx.is_leader_or_second_d.get(m, False)
-        return ctx.is_leader_or_second_en.get(m, False)
+        # D/E/N 統一用 leader+second(third 層級已移除)
+        return ctx.is_leader_or_second_d.get(m, False)
 
     a_is_ldr = ctx.is_leader.get(a, False)
     b_is_ldr = ctx.is_leader.get(b, False)

@@ -88,13 +88,12 @@ def _build_matrix_excel(
     NW = len(weeks)
 
     # 名單按 level 分組排序(Excel 匯出用,不動系統 sort_order):
-    #   資深(leader+second) → 半資深(third) → 一般(member) → 新人 → 行政
-    # 排序後下方「資深/半資深/總數」公式可以用連續列範圍 COUNTIF
+    #   資深(leader+second) → 一般(member) → 新人 → 行政
+    # 排序後下方「資深/總數」公式可以用連續列範圍 COUNTIF
     def _group_key(nr):
         if nr.get("admin_staff"): return 4
         lv = nr.get("level")
         if lv in ("leader", "second"): return 0
-        if lv == "third": return 1
         if nr.get("is_trainee"): return 3
         return 2
     nurse_rows = sorted(nurse_rows, key=_group_key)
@@ -118,9 +117,8 @@ def _build_matrix_excel(
     week_cols = [6 + ND + w for w in range(NW)]   # 每週 OFF 欄
     last_col = 5 + ND + NW
 
-    # 資深/半資深 uid 集合(仍用於某些檢查,如標黃判斷)
+    # 資深 uid 集合(仍用於某些檢查,如標黃判斷);third 層級已移除
     senior_uids = {nr["uid"] for nr in nurse_rows if nr.get("level") in ("leader", "second")}
-    half_senior_uids = {nr["uid"] for nr in nurse_rows if nr.get("level") == "third"}
 
     # Row1：日期（數字）、Row2：星期
     dow_zh = ["一", "二", "三", "四", "五", "六", "日"]
@@ -201,26 +199,10 @@ def _build_matrix_excel(
             if ci in weekend_cols: c.fill = fill_weekend
         ri += 1
 
-    # ── 底部區塊②:D/E/N 半資深(third)人數(每日,公式)
-    _half_r = groups_range.get(1)
-    for sname in ("D", "E", "N"):
-        label = ws.cell(row=ri, column=1, value=f"{sname} 半資深")
-        label.font = bold_font; label.alignment = center; label.border = thin; label.fill = fill_header
-        for ci, d_str in enumerate(cycle_dates, 2):
-            if _half_r:
-                _col = openpyxl.utils.get_column_letter(ci)
-                c = ws.cell(row=ri, column=ci,
-                            value=f'=COUNTIF({_col}{_half_r[0]}:{_col}{_half_r[1]},"{sname}")')
-            else:
-                c = ws.cell(row=ri, column=ci, value=0)
-            c.alignment = center; c.border = thin; c.font = norm_font
-            if ci in weekend_cols: c.fill = fill_weekend
-        ri += 1
-
-    # ── 底部區塊③:D/E/N 總數(每日,公式;新人和行政不計入,所以範圍= group 0+1+2 連續列)
+    # ── 底部區塊③:D/E/N 總數(每日,公式;新人和行政不計入,所以範圍= group 0+2 連續列)
     _total_start = None
     _total_end = None
-    for _g in (0, 1, 2):
+    for _g in (0, 2):
         if _g in groups_range:
             if _total_start is None:
                 _total_start = groups_range[_g][0]
